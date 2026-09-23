@@ -381,6 +381,33 @@
           </div>
         </div>
 
+        <!-- ── Alertas de Estoque e Validade ──────────────────────── -->
+<div id="dash-alertas-wrap" style="display:none;flex-direction:column;gap:10px;margin-bottom:20px">
+
+  <div id="dash-alerta-estoque" class="dash-alerta dash-alerta-vermelho" style="display:none">
+    <div class="dash-alerta-icon"><i class="fas fa-box-open"></i></div>
+    <div class="dash-alerta-body">
+      <div class="dash-alerta-title" id="dash-estoque-titulo">Atenção ao estoque</div>
+      <div class="dash-alerta-sub" id="dash-estoque-lista"></div>
+    </div>
+    <button class="dash-alerta-btn" onclick="document.getElementById('menu-produtos').click()">
+      Ver produtos →
+    </button>
+  </div>
+
+  <div id="dash-alerta-validade" class="dash-alerta dash-alerta-laranja" style="display:none">
+      <div class="dash-alerta-icon"><i class="fas fa-calendar-times"></i></div>
+      <div class="dash-alerta-body">
+        <div class="dash-alerta-title" id="dash-validade-titulo">Atenção à validade</div>
+        <div class="dash-alerta-sub" id="dash-validade-lista"></div>
+      </div>
+      <button class="dash-alerta-btn" onclick="document.getElementById('menu-produtos').click()">
+        Ver produtos →
+      </button>
+    </div>
+
+  </div>
+
         <div class="dash-rankings">
           <div class="card ranking-card">
             <div class="ranking-header">
@@ -1286,6 +1313,15 @@
             <option value="vencido">Vencido</option>
             <option value="proximo">Vence em breve (≤ 3 dias)</option>
             <option value="ok">Dentro do prazo</option>
+          </select>
+        </div>
+        <!-- Status Ativo/Pausado -->
+        <div class="pt-filtro-group">
+          <label class="pt-filtro-label">Status</label>
+          <select id="pt-filtro-status" class="pt-filtro-select" onchange="ptAplicarFiltros()">
+            <option value="">Todos</option>
+            <option value="ativo">🟢 Apenas ativos</option>
+            <option value="pausado">⏸ Apenas pausados</option>
           </select>
         </div>
         <!-- Destaque -->

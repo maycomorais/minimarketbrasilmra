@@ -4037,13 +4037,11 @@ async function buscarProdutoPorBarcode(codigo) {
 
     // Bloqueia se o foco estiver em qualquer input EXCETO o campo de busca do PDV
     // (o leitor USB pode colocar o foco em #pdv-busca ao digitar)
+    // Se o foco está em QUALQUER input (inclusive #pdv-busca), o próprio
+    // input cuida do Enter via pdvBuscaKeydown. Só o listener global age
+    // quando o foco NÃO está em um campo de texto.
     const tag = document.activeElement?.tagName;
-    const isPdvBusca = document.activeElement?.id === "pdv-busca";
-    if (
-      (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") &&
-      !isPdvBusca
-    )
-      return;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
 
     const now = Date.now();
     if (now - _last > 80) _buf = ""; // reset se demorou muito
@@ -4078,6 +4076,7 @@ async function buscarProdutoPorBarcode(codigo) {
 // Retorna true se algum filtro do painel de produtos está ativo
 function _ptFiltrosAtivos() {
   const cat = document.getElementById("pt-filtro-cat")?.value || "";
+  const status = document.getElementById("pt-filtro-status")?.value || "";
   const estoque = document.getElementById("pt-filtro-estoque")?.value || "";
   const validade = document.getElementById("pt-filtro-validade")?.value || "";
   const destaque = document.getElementById("pt-filtro-destaque")?.value || "";
@@ -4090,6 +4089,7 @@ function _ptFiltrosAtivos() {
     ?.classList.contains("on");
   return (
     cat ||
+    status ||
     estoque ||
     validade ||
     destaque ||
@@ -4151,6 +4151,7 @@ function atualizarStatsProdutos(lista) {
 function ptAplicarFiltros() {
   let lista = [..._todosProdutos];
   const cat = document.getElementById("pt-filtro-cat")?.value || "";
+  const status = document.getElementById("pt-filtro-status")?.value || "";
   const estoque = document.getElementById("pt-filtro-estoque")?.value || "";
   const validade = document.getElementById("pt-filtro-validade")?.value || "";
   const destaque = document.getElementById("pt-filtro-destaque")?.value || "";
@@ -4161,7 +4162,13 @@ function ptAplicarFiltros() {
   const apenasEstoque = document
     .getElementById("pt-toggle-estoque")
     ?.classList.contains("on");
+
   if (cat) lista = lista.filter((p) => p.categoria_slug === cat);
+
+  // Status ativo/pausado
+  if (status === "ativo") lista = lista.filter((p) => p.ativo === true);
+  if (status === "pausado") lista = lista.filter((p) => p.ativo === false);
+
   if (estoque === "em_estoque") lista = lista.filter((p) => p.estoque_qtd > 0);
   if (estoque === "zerado")
     lista = lista.filter((p) => p.estoque_qtd !== null && p.estoque_qtd <= 0);
@@ -4240,6 +4247,7 @@ async function ptPopularFiltroCategoria() {
 function ptLimparFiltros() {
   [
     "pt-filtro-cat",
+    "pt-filtro-status",
     "pt-filtro-estoque",
     "pt-filtro-validade",
     "pt-filtro-destaque",
@@ -4298,12 +4306,17 @@ function renderizarCardsProdutos(lista) {
       <button onclick="ptBulkPausar()" style="
         padding:6px 14px;background:#f97316;color:#fff;border:none;border-radius:7px;
         font-size:0.8rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:5px">
-        <i class="fas fa-pause"></i> Pausar selecionados
+        <i class="fas fa-pause"></i> Pausar
+      </button>
+      <button onclick="ptBulkDespausar()" style="
+        padding:6px 14px;background:#22c55e;color:#fff;border:none;border-radius:7px;
+        font-size:0.8rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:5px">
+        <i class="fas fa-play"></i> Despausar
       </button>
       <button onclick="ptBulkExcluir()" style="
         padding:6px 14px;background:#ef4444;color:#fff;border:none;border-radius:7px;
         font-size:0.8rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:5px">
-        <i class="fas fa-trash"></i> Excluir selecionados
+        <i class="fas fa-trash"></i> Excluir
       </button>
       <button onclick="ptBulkDesmarcarTodos()" style="
         padding:6px 10px;background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0;border-radius:7px;
@@ -4532,29 +4545,45 @@ async function ptBulkPausar() {
   const ids = _ptGetIdsSelecionados();
   if (!ids.length) return;
 
-  // Verifica estado atual dos selecionados para decidir a ação
-  const produtosSel = ids.map((id) => _produtosMap[id]).filter(Boolean);
-  const algumAtivo = produtosSel.some((p) => p.ativo);
-  const acao = algumAtivo ? "pausar" : "reativar";
-  const novoStatus = algumAtivo ? false : true;
-
-  if (!confirm(`Deseja ${acao} ${ids.length} produto(s) selecionado(s)?`))
-    return;
+  if (!confirm(`Pausar ${ids.length} produto(s) selecionado(s)?`)) return;
 
   try {
     const { error } = await supa
       .from("produtos")
-      .update({ ativo: novoStatus })
+      .update({ ativo: false })
       .in("id", ids);
 
     if (error) {
       alert("❌ Erro: " + error.message);
     } else {
-      const msg = novoStatus
-        ? `✅ ${ids.length} produto(s) reativado(s)!`
-        : `⏸️ ${ids.length} produto(s) pausado(s)!`;
-      if (typeof mostrarToast === "function")
-        mostrarToast(msg, "success", 3000);
+      const msg = `⏸️ ${ids.length} produto(s) pausado(s)!`;
+      if (typeof mostrarToast === "function") mostrarToast(msg, "success", 3000);
+      else alert(msg);
+      ptBulkDesmarcarTodos();
+      carregarProdutos();
+    }
+  } catch (e) {
+    alert("❌ Erro inesperado: " + e.message);
+  }
+}
+
+async function ptBulkDespausar() {
+  const ids = _ptGetIdsSelecionados();
+  if (!ids.length) return;
+
+  if (!confirm(`Despausar ${ids.length} produto(s) selecionado(s)?`)) return;
+
+  try {
+    const { error } = await supa
+      .from("produtos")
+      .update({ ativo: true })
+      .in("id", ids);
+
+    if (error) {
+      alert("❌ Erro: " + error.message);
+    } else {
+      const msg = `▶️ ${ids.length} produto(s) despausado(s)!`;
+      if (typeof mostrarToast === "function") mostrarToast(msg, "success", 3000);
       else alert(msg);
       ptBulkDesmarcarTodos();
       carregarProdutos();
@@ -4803,6 +4832,9 @@ async function salvarProduto() {
       estoque_qtd: document.getElementById("prod-tem-estoque")?.checked
         ? parseInt(document.getElementById("prod-estoque-qtd")?.value) || 0
         : null,
+      estoque_minimo: document.getElementById("prod-tem-estoque")?.checked
+        ? (parseInt(document.getElementById("prod-estoque-minimo")?.value) || null)
+        : null,
       // ── Preço de compra / custo ───────────────────────────
       preco_compra: (() => {
         const el = document.getElementById("prod-preco-compra");
@@ -4975,6 +5007,9 @@ async function abrirModalProduto(produto = null, tipoInicial = null) {
   }
   const _eqResetEl = document.getElementById("prod-estoque-qtd");
   if (_eqResetEl) _eqResetEl.value = "";
+
+  const _emResetEl = document.getElementById("prod-estoque-minimo");
+  if (_emResetEl) _emResetEl.value = "";
   // Venda por kg
   const _vkResetEl = document.getElementById("prod-venda-kg");
   if (_vkResetEl) {
@@ -5057,6 +5092,9 @@ async function abrirModalProduto(produto = null, tipoInicial = null) {
     }
     const _eqEl = document.getElementById("prod-estoque-qtd");
     if (_eqEl && temEst) _eqEl.value = produto.estoque_qtd;
+    const _emEl = document.getElementById("prod-estoque-minimo");
+    if (_emEl && temEst && produto.estoque_minimo != null)
+      _emEl.value = produto.estoque_minimo;
 
     // Venda por Kg
     const eKg = produto.unidade_venda === "kg" && produto.preco_kg > 0;
@@ -8029,6 +8067,216 @@ async function _uploadLogoIdentidade(input) {
   }
 }
 
+async function _dashVerificarAlertas() {
+  const wrap = document.getElementById("dash-alertas-wrap");
+  if (!wrap) return;
+
+  const LIMITE_PADRAO = 5;
+  const DIAS_ALERTA_PADRAO = 7;
+
+  try {
+    // ── 1. Produtos com estoque controlado ──
+    const { data: prodsEstoque } = await supa
+      .from("produtos")
+      .select("id, nome, estoque_qtd, estoque_minimo")
+      .eq("ativo", true)
+      .not("estoque_qtd", "is", null);
+
+    // ── 2. Variações de produto (varejo) ──
+    const { data: varsEstoque } = await supa
+      .from("produto_variacoes")
+      .select("id, produto_id, nome, estoque_qtd, produtos(nome)")
+      .eq("ativo", true)
+      .eq("controlar_estoque", true)
+      .lte("estoque_qtd", LIMITE_PADRAO);
+
+    // ── 3. Produtos perecíveis ──
+    const { data: prodsValidade } = await supa
+      .from("produtos")
+      .select("id, nome, data_validade, dias_alerta_validade, estoque_qtd")
+      .eq("ativo", true)
+      .eq("perecivel", true)
+      .not("data_validade", "is", null)
+      .order("data_validade", { ascending: true });
+
+    const hoje = new Date();
+    hoje.setHours(0, 0, 0, 0);
+
+    // ── Processa estoque ─────────────────────────────────────
+    const estoqueZerado = [];
+    const estoqueBaixo = [];
+
+    (prodsEstoque || []).forEach((p) => {
+      const minimo = p.estoque_minimo ?? LIMITE_PADRAO;
+      const base = { id: p.id, tipo: "produto", nome: p.nome, qtd: p.estoque_qtd, minimo };
+
+      if (p.estoque_qtd <= 0) {
+        estoqueZerado.push(base);
+      } else if (p.estoque_qtd <= minimo) {
+        estoqueBaixo.push(base);
+      }
+    });
+
+    (varsEstoque || []).forEach((v) => {
+      const base = {
+        id: v.produto_id, // abre o produto-pai no modal
+        tipo: "variacao",
+        nome: `${v.produtos?.nome || "?"} — ${v.nome}`,
+        qtd: v.estoque_qtd,
+        minimo: LIMITE_PADRAO,
+      };
+      if (v.estoque_qtd <= 0) estoqueZerado.push(base);
+      else estoqueBaixo.push(base);
+    });
+
+    // ── Processa validade ────────────────────────────────────
+    const vencidos = [];
+    const proximos = [];
+
+    (prodsValidade || []).forEach((p) => {
+      if (
+        p.estoque_qtd !== null &&
+        p.estoque_qtd !== undefined &&
+        p.estoque_qtd <= 0
+      )
+        return;
+
+      const val = new Date(p.data_validade + "T00:00:00");
+      const dias = Math.ceil((val - hoje) / 86400000);
+      const diasAlerta = p.dias_alerta_validade || DIAS_ALERTA_PADRAO;
+      const base = { id: p.id, tipo: "produto", nome: p.nome, dias };
+
+      if (dias < 0) vencidos.push(base);
+      else if (dias <= diasAlerta) proximos.push(base);
+    });
+
+    // ── Card ESTOQUE ─────────────────────────────────────────
+    const cardEst = document.getElementById("dash-alerta-estoque");
+    const listaEst = document.getElementById("dash-estoque-lista");
+    const tituloEst = document.getElementById("dash-estoque-titulo");
+    const totalEstoque = estoqueZerado.length + estoqueBaixo.length;
+
+    if (totalEstoque > 0 && cardEst && listaEst) {
+      cardEst.style.display = "flex";
+      cardEst.classList.add("dash-alerta--com-chips");
+
+      if (tituloEst) {
+        tituloEst.textContent = estoqueZerado.length
+          ? `⚠️ ${estoqueZerado.length} produto(s) sem estoque` +
+            (estoqueBaixo.length ? ` · ${estoqueBaixo.length} em nível crítico` : "")
+          : `⚠️ Estoque baixo (${estoqueBaixo.length})`;
+      }
+
+      const chips = [];
+      estoqueZerado.forEach((e) => chips.push(_chipEstoque(e, "zero")));
+      estoqueBaixo.forEach((e) => {
+        // Ainda mais crítico se está muito próximo de 0 (<= 50% do mínimo)
+        const severidade = e.qtd <= e.minimo * 0.5 ? "critico" : "baixo";
+        chips.push(_chipEstoque(e, severidade));
+      });
+
+      listaEst.innerHTML = `<div class="dash-alerta-chips">${chips.join("")}</div>`;
+    } else if (cardEst) {
+      cardEst.style.display = "none";
+    }
+
+    // ── Card VALIDADE ────────────────────────────────────────
+    const cardVal = document.getElementById("dash-alerta-validade");
+    const listaVal = document.getElementById("dash-validade-lista");
+    const tituloVal = document.getElementById("dash-validade-titulo");
+    const totalVal = vencidos.length + proximos.length;
+
+    if (totalVal > 0 && cardVal && listaVal) {
+      cardVal.style.display = "flex";
+      cardVal.classList.add("dash-alerta--com-chips");
+
+      if (tituloVal) {
+        tituloVal.textContent = vencidos.length
+          ? `⚠️ ${vencidos.length} produto(s) vencido(s)` +
+            (proximos.length ? ` · ${proximos.length} vencendo em breve` : "")
+          : `Validade próxima (${proximos.length})`;
+      }
+
+      const chips = [];
+      vencidos.forEach((e) => chips.push(_chipValidade(e, "vencido")));
+      proximos.forEach((e) => chips.push(_chipValidade(e, "avencer")));
+
+      listaVal.innerHTML = `<div class="dash-alerta-chips">${chips.join("")}</div>`;
+    } else if (cardVal) {
+      cardVal.style.display = "none";
+    }
+
+    // ── Wrapper ─────────────────────────────────────────────
+    wrap.style.display = totalEstoque > 0 || totalVal > 0 ? "flex" : "none";
+  } catch (e) {
+    console.warn("[dash-alertas]", e.message);
+  }
+}
+
+/* ── Helpers de chip ──────────────────────────────────────── */
+function _chipEstoque(item, severidade) {
+  // severidade: "zero" | "critico" | "baixo"
+  const icon = severidade === "zero" ? "🔴" : "⚠️";
+  const label =
+    severidade === "zero" ? "0" : `${item.qtd}/${item.minimo}`;
+  const tipoTag = item.tipo === "variacao" ? " ·var" : "";
+  return `<button class="dash-alerta-chip dash-alerta-chip--${severidade}"
+    onclick="_dashAbrirProduto(${item.id})"
+    title="${item.nome}${tipoTag} — clique para editar">
+    <span>${icon}</span>
+    <span class="chip-nome">${item.nome}</span>
+    <span class="chip-qtd">${label}</span>
+  </button>`;
+}
+
+function _chipValidade(item, severidade) {
+  // severidade: "vencido" | "avencer"
+  const icon = severidade === "vencido" ? "🚫" : "⏰";
+  const label =
+    severidade === "vencido" ? `${item.dias}d atrás` : `${item.dias}d`;
+  return `<button class="dash-alerta-chip dash-alerta-chip--${severidade}"
+    onclick="_dashAbrirProduto(${item.id})"
+    title="${item.nome} — clique para editar">
+    <span>${icon}</span>
+    <span class="chip-nome">${item.nome}</span>
+    <span class="chip-qtd">${label}</span>
+  </button>`;
+}
+
+/* ── Abre o produto direto no modal de edição ─────────────── */
+async function _dashAbrirProduto(id) {
+  if (!id) return;
+
+  // Tenta reusar o cache local (mais rápido)
+  let prod = typeof _produtosMap !== "undefined" ? _produtosMap[id] : null;
+
+  // Se não tiver em cache (user nunca abriu a aba Produtos), busca no banco
+  if (!prod) {
+    try {
+      const { data } = await supa
+        .from("produtos")
+        .select("*")
+        .eq("id", id)
+        .single();
+      prod = data;
+    } catch (e) {
+      alert("Erro ao carregar produto: " + e.message);
+      return;
+    }
+  }
+
+  if (!prod) {
+    alert("Produto não encontrado.");
+    return;
+  }
+
+  // Garante que o cache esteja populado para o modal
+  if (typeof _produtosMap !== "undefined") _produtosMap[id] = prod;
+
+  // Abre o modal
+  if (typeof abrirModalProduto === "function") abrirModalProduto(prod);
+}
+
 async function carregarDashboard() {
   // Saudação dinâmica
   const hora = new Date().getHours();
@@ -8101,7 +8349,8 @@ async function carregarDashboard() {
   // === RANKING CLIENTES ===
   await carregarRankingClientes();
 
-  // (tabela legada removida)
+  // === ALERTAS DE ESTOQUE E VALIDADE ===   ← ADICIONE ESTA LINHA
+  await _dashVerificarAlertas();
 }
 
 // ══════════════════════════════════════════════════════════
@@ -16545,12 +16794,9 @@ async function impexpSalvar() {
   if (!_impexpDadosImport.length) return;
 
   const btn = document.querySelector("#impexp-preview-wrap .btn-primary");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "Salvando…";
-  }
+  if (btn) { btn.disabled = true; btn.textContent = "Salvando…"; }
 
-  // Normaliza os dados
+  // ── 1. Normaliza os dados (mesmo formato que você já usa) ──
   const payload = _impexpDadosImport
     .filter((r) => r.nome && String(r.nome).trim())
     .map((r) => ({
@@ -16568,43 +16814,97 @@ async function impexpSalvar() {
       promo_tipo: r.promo_tipo || "percent",
       promo_valor: r.promo_valor ? parseFloat(r.promo_valor) : null,
       imagem_url: r.imagem_url || "",
+      codigo_barras: r.codigo_barras || null,
     }));
 
-  // Divide em lotes de 100 para não estourar limites do Supabase
-  const LOTE = 100;
-  let salvos = 0,
-    erros = 0;
+  // ── 2. Deduplica por nome (o JSON tem duplicatas: "Barrinha Bless..."x2) ──
+  //    Mantém o ÚLTIMO registro de cada nome (o que veio por último no array)
+  const mapaUnicos = {};
+  payload.forEach((p) => { mapaUnicos[p.nome] = p; });
+  const payloadUnico = Object.values(mapaUnicos);
 
-  for (let i = 0; i < payload.length; i += LOTE) {
-    const lote = payload.slice(i, i + LOTE);
+  // ── 3. Busca nomes já existentes no banco (uma query só) ──
+  const nomes = payloadUnico.map((p) => p.nome);
+  const { data: existentes, error: errBusca } = await supa
+    .from("produtos")
+    .select("id, nome")
+    .in("nome", nomes);
+
+  if (errBusca) {
+    console.error("Erro ao buscar existentes:", errBusca);
+    alert("❌ Erro ao consultar produtos existentes: " + errBusca.message);
+    if (btn) { btn.disabled = false; btn.textContent = "Salvar"; }
+    return;
+  }
+
+  const mapaExistentes = {};
+  (existentes || []).forEach((e) => { mapaExistentes[e.nome] = e.id; });
+
+  // ── 4. Separa em novos × atualizações ──
+  const novos = [];
+  const atualizacoes = [];
+  payloadUnico.forEach((p) => {
+    if (mapaExistentes[p.nome]) {
+      atualizacoes.push({ id: mapaExistentes[p.nome], dados: p });
+    } else {
+      novos.push(p);
+    }
+  });
+
+  let salvos = 0;
+  let erros = 0;
+  const errosDetalhados = [];
+
+  // ── 5. INSERT dos novos em lotes de 100 ──
+  const LOTE = 100;
+  for (let i = 0; i < novos.length; i += LOTE) {
+    const lote = novos.slice(i, i + LOTE);
+    const { error } = await supa.from("produtos").insert(lote);
+    if (error) {
+      console.error("Insert erro:", error);
+      erros += lote.length;
+      errosDetalhados.push(`INSERT (lote ${Math.floor(i/LOTE)+1}): ${error.message}`);
+    } else {
+      salvos += lote.length;
+    }
+    if (btn) btn.textContent = `Salvando… (${salvos}/${payloadUnico.length})`;
+  }
+
+  // ── 6. UPDATE dos existentes (um a um, é rápido pra ~250 itens) ──
+  for (const item of atualizacoes) {
     const { error } = await supa
       .from("produtos")
-      .upsert(lote, { onConflict: "nome", ignoreDuplicates: false });
+      .update(item.dados)
+      .eq("id", item.id);
     if (error) {
-      console.error("impexpSalvar lote:", error.message);
-      erros += lote.length;
-    } else salvos += lote.length;
-    if (btn) btn.textContent = `Salvando… (${salvos}/${payload.length})`;
+      console.error("Update erro:", error);
+      erros++;
+      errosDetalhados.push(`UPDATE "${item.dados.nome}": ${error.message}`);
+    } else {
+      salvos++;
+    }
+    if (btn) btn.textContent = `Salvando… (${salvos}/${payloadUnico.length})`;
   }
 
   if (btn) {
     btn.disabled = false;
-    btn.textContent = `Salvar ${payload.length} produto(s) no banco`;
+    btn.textContent = `Salvar ${payloadUnico.length} produto(s) no banco`;
   }
 
+  // ── 7. Feedback ──
   if (erros === 0) {
     if (typeof mostrarToast === "function")
-      mostrarToast(
-        `✅ ${salvos} produto(s) importado(s) com sucesso!`,
-        "success",
-        3000,
-      );
+      mostrarToast(`✅ ${salvos} produto(s) importado(s)!`, "success", 3500);
     else alert(`✅ ${salvos} produto(s) importado(s)!`);
     impexpFechar();
     carregarProdutos();
   } else {
+    console.warn("Erros detalhados:", errosDetalhados);
     alert(
-      `⚠️ ${salvos} produto(s) salvos, ${erros} com erro. Verifique o console.`,
+      `⚠️ ${salvos} salvos, ${erros} com erro.\n\n` +
+      errosDetalhados.slice(0, 3).join("\n") +
+      (errosDetalhados.length > 3 ? `\n… e mais ${errosDetalhados.length - 3}` : "") +
+      "\n\nVeja o console (F12) para detalhes."
     );
   }
 }
