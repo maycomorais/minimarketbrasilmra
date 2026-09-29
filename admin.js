@@ -16891,15 +16891,23 @@ function togglePromoFields(on) {
 }
 
 function promoAtualizarPreview() {
-  const tipo = document.getElementById("prod-promo-tipo")?.value || "percent";
-  const valor =
-    parseFloat(document.getElementById("prod-promo-valor")?.value) || 0;
-  const preco = parseFloat(document.getElementById("prod-preco")?.value) || 0;
-  const prev = document.getElementById("prod-promo-preview");
+  const tipo  = document.getElementById("prod-promo-tipo")?.value  || "percent";
+  const valor = parseFloat(document.getElementById("prod-promo-valor")?.value) || 0;
+
+  // ── Lê o preço do dataset.valorNumerico (número puro), com fallback para value
+  const _p = document.getElementById("prod-preco");
+  const preco =
+    parseInt(
+      _p?.dataset?.valorNumerico ||
+      (_p?.value || "").replace(/\D/g, "") ||
+      "0",
+      10
+    ) || 0;
+
+  const prev  = document.getElementById("prod-promo-preview");
   const label = document.getElementById("prod-promo-valor-label");
 
-  if (label)
-    label.textContent = tipo === "percent" ? "Desconto (%)" : "Desconto (Gs)";
+  if (label) label.textContent = tipo === "percent" ? "Desconto (%)" : "Desconto (Gs)";
   if (!prev) return;
 
   if (!valor || !preco) {
@@ -16920,7 +16928,9 @@ function promoAtualizarPreview() {
   prev.innerHTML = `
     De <s style="color:#aaa">Gs ${Math.round(preco).toLocaleString("es-PY")}</s>
     por <b style="color:#dc2626">Gs ${Math.round(precoFinal).toLocaleString("es-PY")}</b>
-    ${tipo === "percent" ? `(${valor}% off)` : `(- Gs ${Math.round(valor).toLocaleString("es-PY")})`}
+    ${tipo === "percent"
+      ? `(${valor}% off)`
+      : `(- Gs ${Math.round(valor).toLocaleString("es-PY")})`}
   `;
 }
 
