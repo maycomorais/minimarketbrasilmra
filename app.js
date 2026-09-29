@@ -3301,49 +3301,119 @@ async function calcularFrete() {
   const msg = document.getElementById("frete-msg");
   const boxErro = document.getElementById("box-erro-gps");
 
-  btn.innerText = "Localizando...";
+  // ── Guard: elementos essenciais existem? ────────────────────────
+  if (!btn || !msg || !boxErro) {
+    console.warn("[calcularFrete] Elementos do DOM não encontrados");
+    return;
+  }
+
+  // ── Reseta estado visual ────────────────────────────────────────
+  btn.innerText = "⏳ Localizando...";
   btn.disabled = true;
+  msg.style.color = "";
+  msg.innerHTML =
+    '<span style="color:#888">⏳ Obtendo sua localização...</span>';
+  boxErro.style.display = "none";
 
   // ── Guard: loja precisa ter coordenadas configuradas ────────────
   if (!COORD_LOJA.lat || !COORD_LOJA.lng) {
     msg.innerHTML =
       '<span style="color:#e74c3c">⚠️ Loja sem coordenadas configuradas. Contate o suporte.</span>';
-    boxErro.style.display = "none";
     btn.innerText = "📍 Calcular Envio";
     btn.disabled = false;
     return;
   }
 
-  if (!navigator.geolocation) {
+  // ── Guard: HTTPS obrigatório para Geolocation API ───────────────
+  const _protocoloSeguro =
+    location.protocol === "https:" ||
+    location.hostname === "localhost" ||
+    location.hostname === "127.0.0.1";
+  if (!_protocoloSeguro) {
     msg.innerHTML =
-      '<span style="color:#e74c3c">GPS não disponível neste dispositivo.</span>';
+      '<span style="color:#e74c3c">⚠️ GPS requer HTTPS. Acesse o site via <code>https://</code></span>';
+    boxErro.innerHTML = `
+      <p><strong><i class="fas fa-info-circle"></i> Sem HTTPS o GPS não funciona</strong></p>
+      <p style="margin-top:6px">Você pode aplicar a <strong>taxa padrão de entrega</strong> ou combinar o valor pelo WhatsApp.</p>
+      <label style="display:flex;align-items:center;gap:10px;margin-top:8px;cursor:pointer;">
+        <input type="checkbox" id="check-sem-gps" style="width:20px;height:20px;" onchange="aplicarFreteFixo()">
+        <span>Aplicar taxa padrão de entrega</span>
+      </label>`;
     boxErro.style.display = "block";
     btn.innerText = "📍 Calcular Envio";
     btn.disabled = false;
     return;
   }
 
-  // ── Obtém posição do cliente ────────────────────────────────────
+  // ── Guard: API de geolocalização disponível? ────────────────────
+  if (!navigator.geolocation) {
+    msg.innerHTML =
+      '<span style="color:#e74c3c">GPS não disponível neste dispositivo.</span>';
+    btn.innerText = "📍 Calcular Envio";
+    btn.disabled = false;
+    return;
+  }
+
+  // ────────────────────────────────────────────────────────────────
+  //  WATCHDOG: se nenhum callback disparar em 15s, destrava o botão
+  //  O timeout nativo do browser NÃO é confiável — este é o backup.
+  // ────────────────────────────────────────────────────────────────
+  let _gpsFinalizado = false;
+  const _watchdog = setTimeout(() => {
+    if (_gpsFinalizado) return;
+    _gpsFinalizado = true;
+    console.warn(
+      "[calcularFrete] Watchdog disparou — geolocation não respondeu em 15s",
+    );
+
+    msg.innerHTML =
+      '<span style="color:#e74c3c">⚠️ GPS não respondeu. Verifique se a localização está ativa no navegador.</span>';
+    boxErro.innerHTML = `
+      <p><strong><i class="fas fa-info-circle"></i> GPS não respondeu?</strong></p>
+      <p style="margin-top:6px">Isso pode acontecer se você negou a permissão ou se a localização está desativada no dispositivo.</p>
+      <label style="display:flex;align-items:center;gap:10px;margin-top:8px;cursor:pointer;">
+        <input type="checkbox" id="check-sem-gps" style="width:20px;height:20px;" onchange="aplicarFreteFixo()">
+        <span>Aplicar taxa padrão de entrega</span>
+      </label>`;
+    boxErro.style.display = "block";
+    btn.innerText = "📍 Tentar Novamente";
+    btn.disabled = false;
+  }, 15000);
+
+  // ────────────────────────────────────────────────────────────────
+  //  Obtém posição do cliente
+  // ────────────────────────────────────────────────────────────────
   navigator.geolocation.getCurrentPosition(
+    // ── Callback de sucesso ──────────────────────────────────────
     async (position) => {
+      if (_gpsFinalizado) return;
+      _gpsFinalizado = true;
+      clearTimeout(_watchdog);
+
       localCliente = {
         lat: position.coords.latitude,
         lng: position.coords.longitude,
       };
 
+      msg.style.color = "";
       msg.innerHTML =
         '<span style="color:#888">⏳ Calculando rota real...</span>';
 
-      // ── Calcula distância pela ROTA REAL via OSRM ────────────────
-      const dist = await obterDistanciaPelaRota(
-        COORD_LOJA.lat,
-        COORD_LOJA.lng,
-        localCliente.lat,
-        localCliente.lng,
-      );
+      // ── Calcula distância pela ROTA REAL via OSRM ──────────────
+      let dist = null;
+      try {
+        dist = await obterDistanciaPelaRota(
+          COORD_LOJA.lat,
+          COORD_LOJA.lng,
+          localCliente.lat,
+          localCliente.lng,
+        );
+      } catch (_e) {
+        dist = null;
+      }
 
-      // ── OSRM falhou → aplicar taxa padrão (2,1–3 km) ─────────────
-      if (dist === null) {
+      // ── OSRM falhou ou retornou valor inválido → taxa padrão ───
+      if (dist === null || !Number.isFinite(dist) || dist <= 0) {
         const r = calcularFreteSemLocalizacao(TABELA_FRETE);
         freteCalculado = r.loja;
         freteMotoboy = r.motoboy;
@@ -3355,61 +3425,55 @@ async function calcularFrete() {
         } else {
           msg.innerHTML = `<span style="color:#e67e22">⚠️ Rota indisponível. Aplicada taxa padrão: Gs ${r.loja.toLocaleString("es-PY")}</span>`;
         }
-        boxErro.style.display = "none";
-        btn.innerText = "✅ Localização OK";
-        btn.disabled = true;
-        atualizarTotalCheckout();
-        return;
+      }
+      // ── OSRM OK → aplicar faixa real (ou "a combinar") ────────
+      else {
+        const r = calcularFretePorDistancia(dist, TABELA_FRETE);
+        freteCalculado = r.loja;
+        freteMotoboy = r.motoboy;
+        freteACombinar = r.acombinar === true;
+        freteSemGPS = false;
+
+        if (freteACombinar) {
+          msg.innerHTML = `<span style="color:#e67e22">✅ Rota: ${dist.toFixed(1)}km — Frete <strong>a combinar</strong></span>`;
+        } else {
+          msg.innerHTML = `<span style="color:#27ae60">✅ Rota: ${dist.toFixed(1)}km — Frete: Gs ${r.loja.toLocaleString("es-PY")}</span>`;
+        }
       }
 
-      // ── OSRM OK → aplicar faixa real (ou "a combinar" se admin marcou) ──
-      const r = calcularFretePorDistancia(dist, TABELA_FRETE);
-      freteCalculado = r.loja;
-      freteMotoboy = r.motoboy;
-      freteACombinar = r.acombinar === true;
-      freteSemGPS = false;
-
-      if (freteACombinar) {
-        msg.innerHTML = `<span style="color:#e67e22">✅ Rota: ${dist.toFixed(1)}km — Frete <strong>a combinar</strong></span>`;
-      } else {
-        msg.innerHTML = `<span style="color:#27ae60">✅ Rota: ${dist.toFixed(1)}km — Frete: Gs ${r.loja.toLocaleString("es-PY")}</span>`;
-      }
-      msg.style.color = "#27ae60";
       boxErro.style.display = "none";
       btn.innerText = "✅ Localização OK";
       btn.disabled = true;
       atualizarTotalCheckout();
     },
-    (err) => {
-      // ── GPS falhou / negado → mostra checkbox p/ taxa padrão ─────
-      let errMsg = "Não foi possível obter sua localização.";
-      let instrucao = "";
 
-      if (err.code === 1) {
-        errMsg = "⚠️ Permissão de GPS negada.";
-        instrucao =
-          '<p style="margin-top:6px;font-size:0.85rem">Habilite a localização OU marque a opção abaixo para aplicar a <strong>taxa padrão de entrega</strong>.</p>';
-      } else if (err.code === 2) {
+    // ── Callback de erro ─────────────────────────────────────────
+    (err) => {
+      if (_gpsFinalizado) return;
+      _gpsFinalizado = true;
+      clearTimeout(_watchdog);
+
+      let errMsg = "Não foi possível obter sua localização.";
+      if (err.code === 1) errMsg = "⚠️ Permissão de GPS negada.";
+      else if (err.code === 2)
         errMsg = "⚠️ Localização indisponível. Verifique se o GPS está ativo.";
-      } else if (err.code === 3) {
-        errMsg = "⚠️ Tempo esgotado ao obter localização.";
-      }
+      else if (err.code === 3) errMsg = "⚠️ Tempo esgotado ao obter localização.";
 
       msg.innerHTML = `<span style="color:#e74c3c">${errMsg}</span>`;
       boxErro.innerHTML = `
         <p><strong><i class="fas fa-info-circle"></i> GPS não funcionou?</strong></p>
-        ${instrucao}
-        <p style="margin-top:6px">Marque para aplicar a <strong>taxa padrão de entrega</strong> (equivalente a 2–3 km) e prosseguir. O Valor pode ser atualizado</p>
+        <p style="margin-top:6px">Você pode aplicar a <strong>taxa padrão de entrega</strong> (equivalente a 2–3 km) e prosseguir.</p>
         <label style="display:flex;align-items:center;gap:10px;margin-top:8px;cursor:pointer;">
-          <input type="checkbox" id="check-sem-gps" style="width:20px;height:20px;"
-                 onchange="aplicarFreteFixo()">
+          <input type="checkbox" id="check-sem-gps" style="width:20px;height:20px;" onchange="aplicarFreteFixo()">
           <span>Aplicar taxa padrão de entrega</span>
         </label>`;
       boxErro.style.display = "block";
       btn.innerText = "📍 Tentar Novamente";
       btn.disabled = false;
     },
-    { timeout: 12000, maximumAge: 60000, enableHighAccuracy: true },
+
+    // ── Opções ────────────────────────────────────────────────────
+    { timeout: 10000, maximumAge: 60000, enableHighAccuracy: true },
   );
 }
 
@@ -3494,7 +3558,6 @@ async function enviarZap() {
 
     // Promoções do dia: bloquear pagamento com Cartão
     const temPromoItem = carrinho.some((item) => {
-      // Verifica se algum item do carrinho pertence a categoria promocoes_do_dia
       for (const key in MENU) {
         if (key === "promocoes_do_dia") {
           const found = MENU[key].find(
@@ -3511,8 +3574,8 @@ async function enviarZap() {
       );
     }
 
-    // Pedido duplo: bloqueia se mesmo carrinho enviado no último 1h
-    // Verificado ANTES do insert para cobrir múltiplas abas simultâneas
+    // Anti-duplicata do lado do cliente: bloqueia reenvio do MESMO carrinho
+    // em até 1h. A chave enviada ao servidor é diferente — esta é só UX.
     const _agora = Date.now();
     const _ultimoHash = localStorage.getItem("locanda_last_hash");
     const _ultimoTs = parseInt(localStorage.getItem("locanda_last_ts") || "0");
@@ -3525,7 +3588,6 @@ async function enviarZap() {
         "🚫 Seu pedido anterior foi computado, estamos bloqueando esta segunda tentativa.",
       );
     }
-    // Grava o hash ANTES do insert (protege múltiplas abas abertas ao mesmo tempo)
     localStorage.setItem("locanda_last_hash", _hashAtual);
     localStorage.setItem("locanda_last_ts", _agora.toString());
 
@@ -3568,7 +3630,6 @@ async function enviarZap() {
       return;
     }
 
-    // Bloqueio: cliente fora do raio de cobertura (freteCalculado === null)
     if (modoEntrega === "delivery" && freteCalculado === null) {
       alert(
         "Sua localização está fora da área de entrega da loja. Não é possível finalizar o pedido.",
@@ -3578,14 +3639,13 @@ async function enviarZap() {
 
     const usouPlanoB = document.getElementById("check-sem-gps")?.checked;
     const ref = document.getElementById("cli-ref").value || "";
-    // Sanitiza telefone: remove +, -, espaços, parênteses e outros não-numéricos
-    // Caso o cliente cole um número do WhatsApp como "+595 984 692537"
     const telSanitizado = tel.replace(/[^\d]/g, "");
     const telCompleto = ddi + telSanitizado;
 
     const totalItens = carrinho.reduce((a, i) => a + i.preco * i.qtd, 0);
     let desconto = 0;
     let freteAplicado = freteCalculado;
+    let freteACombinarLocal = freteACombinar;
 
     if (cupomAplicado) {
       if (cupomAplicado.tipo === "percentual") {
@@ -3598,16 +3658,23 @@ async function enviarZap() {
     const totalGeral =
       totalItens - desconto + (modoEntrega === "delivery" ? freteAplicado : 0);
 
-    // 1. Salva no Banco PRIMEIRO para pegar o ID real
+    // ─────────────────────────────────────────────────────────────────
+    //  INSERE VIA EDGE FUNCTION (validação server-side autoritativa)
+    //  Fallback: se a função não estiver deployada (404), faz INSERT
+    //  direto para não quebrar a operação em produção.
+    // ─────────────────────────────────────────────────────────────────
     let pedidoDbId = null;
     let numeroPedido = null;
+    let _dupResposta = false;
 
     if (typeof supa !== "undefined") {
-      // Chave de idempotência: hash do carrinho + telefone + minuto atual
-      // Garante que mesmo se o cliente enviar duas vezes em < 2 min, só 1 pedido é criado
+      // Chave de idempotência com bucket de 2 MINUTOS.
+      // - Retries dentro da janela → mesma chave → servidor deduplica
+      // - Compras futuras legítimas → novo bucket → nova chave → UNIQUE ok
+      const _pdvTimeBucket = Math.floor(Date.now() / 120000);
       const _iKey = btoa(
         encodeURIComponent(
-          _hashAtual + "|" + telCompleto + "|" + Math.floor(Date.now() / 60000),
+          _hashAtual + "|" + telCompleto + "|" + _pdvTimeBucket,
         ),
       ).slice(0, 64);
 
@@ -3618,8 +3685,9 @@ async function enviarZap() {
         subtotal: totalItens,
         frete_cobrado_cliente: modoEntrega === "delivery" ? freteAplicado : 0,
         frete_motoboy: modoEntrega === "delivery" ? freteMotoboy : 0,
-        frete_a_combinar: modoEntrega === "delivery" ? freteACombinar : false,
+        frete_a_combinar: modoEntrega === "delivery" ? freteACombinarLocal : false,
         desconto_cupom: desconto,
+        cupom_codigo: cupomAplicado?.codigo || null,
         total_geral: totalGeral,
         forma_pagamento: pag,
         obs_pagamento:
@@ -3631,16 +3699,15 @@ async function enviarZap() {
         itens: carrinho.map((i) => ({
           produto_id: i.produto_id || i.id,
           n: i.nome,
-          nome: i.nome, // alias legível para admin/motoboy
+          nome: i.nome,
           p: i.preco,
           q: i.qtd,
-          qtd: i.qtd, // alias legível
+          qtd: i.qtd,
           t: i.variacao || "",
           pr: i.preparo || "",
           m: i.montagem,
           o: i.obs,
-          categoria_slug: i.categoria_slug || i.cat || "", // para filtro de bebidas no motoboy
-          // ── Metadados de faixa (varejo/atacado) ──
+          categoria_slug: i.categoria_slug || i.cat || "",
           _tier: i._faixaTier ?? null,
           _faixaAplicada: i._faixaAplicada ?? null,
           _extrasSoma: i._extrasSoma ?? 0,
@@ -3656,33 +3723,117 @@ async function enviarZap() {
               razao: document.getElementById("cli-zao").value,
             }
           : null,
+        // ⚡ NOVO (push): inclui a subscription da Push API no payload.
+        // Se o usuário não ativou notificações, o valor é null e o
+        // cliente simplesmente não receberá push deste pedido.
+        push_subscription: _pushSubscriptionCache || null,
       };
 
-      const { data: pedidoSalvo, error } = await supa
-        .from("pedidos")
-        .insert([pedidoDb])
-        .select()
-        .single();
+      // 1ª tentativa: Edge Function autoritativa
+      let _fnOk = false;
+      try {
+        const { data: _fnRes, error: _fnErr } = await supa.functions.invoke(
+          "validar-pedido",
+          { body: pedidoDb },
+        );
 
-      if (error) {
-        console.error("Erro ao salvar pedido:", error);
-        alert("⚠️ Erro ao salvar pedido no sistema. Tente novamente.");
-        return;
+        if (_fnErr) {
+          // Extrai mensagem do corpo (o invoke retorna FunctionsHttpError em non-2xx)
+          let _msg = "Erro ao processar pedido";
+          try {
+            const _ctx = _fnErr.context;
+            if (_ctx && typeof _ctx.json === "function") {
+              const _j = await _ctx.clone().json();
+              _msg = _j?.error || _msg;
+            } else if (_fnErr.message) {
+              _msg = _fnErr.message;
+            }
+          } catch (_) {
+            if (_fnErr.message) _msg = _fnErr.message;
+          }
+
+          // 404 = Edge Function não deployada → fallback para INSERT direto
+          const _is404 =
+            _fnErr.context?.status === 404 ||
+            /not found/i.test(_fnErr.message || "");
+          if (_is404) {
+            console.warn(
+              "[enviarZap] validar-pedido não deployada — usando INSERT direto",
+            );
+          } else {
+            alert("❌ " + _msg);
+            return;
+          }
+        } else if (_fnRes?.error) {
+          alert("❌ " + _fnRes.error);
+          return;
+        } else if (_fnRes?.id) {
+          pedidoDbId = _fnRes.id;
+          numeroPedido = _fnRes.id;
+          _dupResposta = _fnRes.duplicate === true;
+          // Atualiza frete com o valor autoritativo do servidor
+          if (_fnRes.frete_cobrado_cliente != null)
+            freteAplicado = _fnRes.frete_cobrado_cliente;
+          if (_fnRes.frete_a_combinar != null)
+            freteACombinarLocal = _fnRes.frete_a_combinar;
+          _fnOk = true;
+        }
+      } catch (_e) {
+        console.warn(
+          "[enviarZap] Falha ao invocar Edge Function, usando INSERT direto:",
+          _e.message,
+        );
       }
 
-      if (pedidoSalvo) {
-        pedidoDbId = pedidoSalvo.id;
-        numeroPedido = pedidoSalvo.id; // USA O ID DO BANCO
-        console.log("✅ Pedido salvo com ID:", pedidoDbId);
+      // Fallback: INSERT direto quando a Edge Function não respondeu
+      if (!_fnOk) {
+        const { data: pedidoSalvo, error } = await supa
+          .from("pedidos")
+          .insert([pedidoDb])
+          .select()
+          .single();
 
-        // Incrementa contador de usos do cupom
-        if (cupomAplicado?.id) {
-          const novosUsos = (cupomAplicado.usos_realizados || 0) + 1;
-          await supa
-            .from("cupons")
-            .update({ usos_realizados: novosUsos })
-            .eq("id", cupomAplicado.id);
+        if (error) {
+          if (
+            error.code === "23505" ||
+            /duplicate key/i.test(error.message || "")
+          ) {
+            alert(
+              "⚠️ Este pedido já foi registrado. Verifique o histórico de pedidos.",
+            );
+            return;
+          }
+          console.error("Erro ao salvar pedido:", error);
+          alert("⚠️ Erro ao salvar pedido no sistema. Tente novamente.");
+          return;
         }
+
+        if (pedidoSalvo) {
+          pedidoDbId = pedidoSalvo.id;
+          numeroPedido = pedidoSalvo.id;
+        }
+      }
+
+      // Incrementa contador de usos do cupom (só se pedido realmente criado)
+      if (!_dupResposta && cupomAplicado?.id && pedidoDbId) {
+        const novosUsos = (cupomAplicado.usos_realizados || 0) + 1;
+        await supa
+          .from("cupons")
+          .update({ usos_realizados: novosUsos })
+          .eq("id", cupomAplicado.id);
+      }
+
+      // Se foi duplicado, avisa o cliente e mostra o tracking
+      if (_dupResposta) {
+        alert(
+          `✅ Seu pedido já havia sido registrado (#${numeroPedido}). Redirecionando para o acompanhamento.`,
+        );
+        carrinho = [];
+        cupomAplicado = null;
+        updateUI();
+        fecharCheckout();
+        mostrarCardTracking(numeroPedido);
+        return;
       }
     }
 
@@ -3701,24 +3852,24 @@ async function enviarZap() {
     msg += `📱 Tel: ${telCompleto}\n`;
     msg += `🛵 Tipo: ${modoEntrega === "delivery" ? "DELIVERY" : modoEntrega === "local" ? "COMER NO LOCAL 🍽️" : "RETIRADA"}\n`;
 
-          if (modoEntrega === "delivery") {
-            if (localCliente) {
-              msg += `📍 Maps: https://maps.google.com/?q=${localCliente.lat},${localCliente.lng}\n`;
-            } else if (usouPlanoB) {
-              msg += `📍 *Localização:* Enviarei aqui no WhatsApp 📎\n`;
-            }
+    if (modoEntrega === "delivery") {
+      if (localCliente) {
+        msg += `📍 Maps: https://maps.google.com/?q=${localCliente.lat},${localCliente.lng}\n`;
+      } else if (usouPlanoB) {
+        msg += `📍 *Localização:* Enviarei aqui no WhatsApp 📎\n`;
+      }
 
-            if (freteACombinar) {
-              msg += `🛵 *Delivery:* 🤝 A COMBINAR (motoboy + cliente combinam)\n`;
-            } else if (freteSemGPS) {
-              msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")} (taxa padrão)\n`;
-            } else if (freteCalculado === 0) {
-              msg += `🛵 *Delivery:* Grátis\n`;
-            } else {
-              msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
-            }
-            msg += `🏠 Ref: ${ref}\n`;
-          }
+      if (freteACombinarLocal) {
+        msg += `🛵 *Delivery:* 🤝 A COMBINAR (motoboy + cliente combinam)\n`;
+      } else if (freteSemGPS) {
+        msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")} (taxa padrão)\n`;
+      } else if (freteAplicado === 0) {
+        msg += `🛵 *Delivery:* Grátis\n`;
+      } else {
+        msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
+      }
+      msg += `🏠 Ref: ${ref}\n`;
+    }
 
     msg += `--------------------------\n`;
     carrinho.forEach((item) => {
@@ -3738,16 +3889,20 @@ async function enviarZap() {
       msg += `Desconto (${cupomAplicado.codigo}): -Gs ${desconto.toLocaleString("es-PY")}\n`;
     }
 
+    // Recalcula totalGeral com os valores autoritativos do servidor
+    const totalGeralFinal =
+      totalItens - desconto + (modoEntrega === "delivery" ? freteAplicado : 0);
+
     if (modoEntrega === "delivery" && !usouPlanoB) {
-      if (freteACombinar) {
+      if (freteACombinarLocal) {
         msg += `Delivery: 🤝 A COMBINAR\n`;
-        msg += `TOTAL (sem frete): Gs ${totalGeral.toLocaleString("es-PY")}\n`;
+        msg += `TOTAL (sem frete): Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
       } else {
         msg += `Delivery: Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
-        msg += `TOTAL: Gs ${totalGeral.toLocaleString("es-PY")}\n`;
+        msg += `TOTAL: Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
       }
     } else {
-      msg += `TOTAL: Gs ${totalGeral.toLocaleString("es-PY")}\n`;
+      msg += `TOTAL: Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
     }
     msg += `--------------------------\n`;
 
@@ -3768,11 +3923,11 @@ async function enviarZap() {
       msg += `💰 Pagamento: ${pag}\n`;
     }
 
-    // Avisos de Pix/Alias (Bilíngue)
+    // Avisos de Pix/Alias
     if (pag === "Pix" || pag === "Transferencia") {
       if (pag === "Pix") {
         const totalBrl =
-          COTACAO_REAL > 0 ? (totalGeral / COTACAO_REAL).toFixed(2) : "---";
+          COTACAO_REAL > 0 ? (totalGeralFinal / COTACAO_REAL).toFixed(2) : "---";
         msg += `\n💠 Chave Pix: ${CHAVE_PIX}\n`;
         msg += `💰 Valor em Reais: R$ ${totalBrl}\n`;
       }
@@ -3780,7 +3935,6 @@ async function enviarZap() {
       msg += `\n⚠️ *Envie o comprovante após o pagamento!*\n`;
     }
 
-    // Para multipagamento: avisar sobre Pix ou Transferencia se incluídos
     if (pag === "Multipagamento") {
       const partes = _coletarMultiPagamento();
       partes.forEach((p, idx) => {
@@ -3800,14 +3954,10 @@ async function enviarZap() {
         msg += `\n⚠️ *Envie o(s) comprovante(s) após o pagamento!*\n`;
     }
 
-    // Factura
     if (document.getElementById("check-factura").checked) {
       msg += `\n📄 RUC: ${document.getElementById("cli-ruc").value}\nRazão: ${document.getElementById("cli-zao").value}\n`;
     }
 
-    // Hash anti-duplicata já foi salvo acima antes do insert
-
-    // Verifica se o pagamento exige envio de comprovante pelo WhatsApp
     const _precisaZap = (() => {
       if (pag === "Pix" || pag === "Transferencia") return true;
       if (pag === "Multipagamento") {
@@ -3820,12 +3970,9 @@ async function enviarZap() {
     })();
 
     if (_precisaZap) {
-      // Pagamento digital: exige envio de comprovante → abre WhatsApp obrigatoriamente
       await _mostrarModalEnvio(msg, numeroPedido);
     } else {
-      // Pagamento em dinheiro/cartão/QR: pedido já está registrado, só confirma
       _mostrarConfirmacaoPedido(numeroPedido);
-      // Limpa carrinho
       carrinho = [];
       cupomAplicado = null;
       MODO_AGENDAMENTO = false;
@@ -4995,3 +5142,288 @@ function _cfAtualizarUI() {
     btnAdd.style.cursor = exato ? "pointer" : "not-allowed";
   }
 }
+
+function _pdvParseQtyPrefix(input) {
+  const s = (input || "").trim();
+  const m = s.match(/^(\d+)\s*[x+]\s*(.+)$/i);
+  if (m) return { qty: parseInt(m[1], 10) || 1, code: m[2].trim() };
+  return { qty: 1, code: s };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  WEB PUSH — Notificações do status do pedido em tempo real
+//
+//  Fluxo:
+//    1. _pushInicializar() roda no DOMContentLoaded
+//    2. Se já autorizado, revalida a subscription silenciosamente
+//    3. Se não, mostra banner de ativação após 4s
+//    4. Usuário clica em "Ativar" → _pushSolicitarPermissao()
+//    5. _pushRegistrar() captura a PushSubscription e guarda em cache
+//    6. enviarZap() inclui _pushSubscriptionCache no payload do pedido
+//    7. Edge Function notificar-cliente usa a subscription para enviar push
+// ═══════════════════════════════════════════════════════════════════
+
+let _pushSubscriptionCache = null;
+let _vapidKeyCache = null;
+
+/**
+ * Converte chave VAPID Base64 URL-safe → Uint8Array.
+ * Formato exigido pelo PushManager.subscribe().
+ */
+function _pushUrlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64  = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+}
+
+/**
+ * Verifica suporte do navegador a Push API.
+ */
+function _pushSuportado() {
+  return (
+    typeof window !== "undefined" &&
+    "serviceWorker" in navigator &&
+    "PushManager" in window &&
+    "Notification" in window
+  );
+}
+
+/**
+ * Carrega a chave pública VAPID de configuracoes (cache em memória).
+ * Retorna "" se não configurada.
+ */
+async function _pushCarregarVapidKey() {
+  if (_vapidKeyCache !== null) return _vapidKeyCache;
+  try {
+    const { data } = await supa
+      .from("configuracoes")
+      .select("vapid_public_key")
+      .maybeSingle();
+    _vapidKeyCache = (data?.vapid_public_key || "").trim();
+  } catch (_) {
+    _vapidKeyCache = "";
+  }
+  return _vapidKeyCache;
+}
+
+/**
+ * Registra a PushSubscription no navegador e guarda em _pushSubscriptionCache.
+ * Só executa se o usuário concedeu permissão.
+ *
+ * Se houver um pedido ativo em tracking (localStorage.locanda_pedido_id),
+ * vincula a subscription a esse pedido — assim o cliente recebe notificações
+ * do pedido mesmo ativando as notificações APÓS finalizar a compra.
+ *
+ * Retorna { ok: boolean, subscription?: object, erro?: string }.
+ */
+async function _pushRegistrar() {
+  if (!_pushSuportado()) {
+    return { ok: false, erro: "Navegador sem suporte a notificações push." };
+  }
+
+  const vapidKey = await _pushCarregarVapidKey();
+  if (!vapidKey) {
+    console.warn("[Push] vapid_public_key não configurada em `configuracoes`.");
+    return { ok: false, erro: "VAPID pública não configurada." };
+  }
+
+  if (Notification.permission !== "granted") {
+    return { ok: false, erro: "Permissão não concedida." };
+  }
+
+  try {
+    const reg = await navigator.serviceWorker.ready;
+
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: _pushUrlBase64ToUint8Array(vapidKey),
+      });
+    }
+
+    _pushSubscriptionCache = sub.toJSON();
+    console.log("[Push] Subscription registrada:", _pushSubscriptionCache.endpoint);
+
+    // Se há um pedido ativo sendo rastreado, vincula a subscription a ele
+    const pedidoIdAtivo = localStorage.getItem("locanda_pedido_id");
+    if (pedidoIdAtivo) {
+      try {
+        const { error } = await supa
+          .from("pedidos")
+          .update({ push_subscription: _pushSubscriptionCache })
+          .eq("id", parseInt(pedidoIdAtivo, 10));
+        if (!error) {
+          console.log(`[Push] Subscription vinculada ao pedido #${pedidoIdAtivo}`);
+        }
+      } catch (_) {
+        /* silencioso — não bloqueia a ativação */
+      }
+    }
+
+    return { ok: true, subscription: _pushSubscriptionCache };
+  } catch (e) {
+    console.warn("[Push] Falha ao registrar subscription:", e.message);
+    return { ok: false, erro: e.message };
+  }
+}
+
+/**
+ * Solicita permissão ao usuário e registra a subscription.
+ * Chamada pelo botão "Ativar" do banner.
+ */
+async function _pushSolicitarPermissao() {
+  if (!_pushSuportado()) {
+    if (typeof mostrarToast === "function") {
+      mostrarToast("Este navegador não suporta notificações.", "warning", 3500);
+    }
+    return;
+  }
+
+  const vapidKey = await _pushCarregarVapidKey();
+  if (!vapidKey) {
+    if (typeof mostrarToast === "function") {
+      mostrarToast(
+        "Notificações ainda não configuradas pela loja.",
+        "warning",
+        4000,
+      );
+    }
+    return;
+  }
+
+  let perm = Notification.permission;
+  if (perm === "default") {
+    perm = await Notification.requestPermission();
+  }
+
+  if (perm !== "granted") {
+    _pushFecharBanner();
+    return;
+  }
+
+  const r = await _pushRegistrar();
+  if (r.ok) {
+    _pushFecharBanner();
+    if (typeof mostrarToast === "function") {
+      mostrarToast("✅ Notificações ativadas!", "success", 3500);
+    }
+  } else {
+    if (typeof mostrarToast === "function") {
+      mostrarToast("⚠️ Não foi possível ativar as notificações.", "warning", 3500);
+    }
+  }
+}
+
+/**
+ * Mostra o banner de ativação de notificações.
+ * Só aparece se: suportado, não autorizado, e ainda não exibido.
+ */
+function _pushMostrarBanner() {
+  if (!_pushSuportado()) return;
+  if (Notification.permission === "granted") return;
+  if (document.getElementById("push-banner")) return;
+
+  // Injeta a animação uma única vez
+  if (!document.getElementById("_push-banner-style")) {
+    const s = document.createElement("style");
+    s.id = "_push-banner-style";
+    s.textContent =
+      "@keyframes _pushSlideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}";
+    document.head.appendChild(s);
+  }
+
+  const banner = document.createElement("div");
+  banner.id = "push-banner";
+  banner.style.cssText = [
+    "position:fixed",
+    "bottom:88px",
+    "left:16px",
+    "right:16px",
+    "max-width:480px",
+    "margin:0 auto",
+    "z-index:96",
+    "background:#fff",
+    "border-radius:14px",
+    "padding:14px 16px",
+    "box-shadow:0 8px 28px rgba(0,0,0,0.18)",
+    "display:flex",
+    "align-items:center",
+    "gap:12px",
+    "border-left:4px solid var(--primary,#1a7a2e)",
+    "animation:_pushSlideUp 0.3s ease",
+  ].join(";");
+
+  banner.innerHTML = `
+    <div style="font-size:1.6rem;flex-shrink:0">🔔</div>
+    <div style="flex:1;min-width:0">
+      <div style="font-weight:700;font-size:0.9rem;color:#1a1a1a">Ativar notificações?</div>
+      <div style="font-size:0.78rem;color:#777;margin-top:2px;line-height:1.35">
+        Receba atualizações do status do seu pedido em tempo real.
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:6px;flex-shrink:0">
+      <button id="_push-btn-sim"
+        style="padding:7px 14px;background:var(--primary,#1a7a2e);color:#fff;border:none;border-radius:8px;font-weight:700;font-size:0.78rem;cursor:pointer">
+        Ativar
+      </button>
+      <button id="_push-btn-nao"
+        style="padding:6px 12px;background:transparent;color:#999;border:none;font-size:0.72rem;cursor:pointer">
+        Agora não
+      </button>
+    </div>
+  `;
+
+  document.body.appendChild(banner);
+
+  banner
+    .querySelector("#_push-btn-sim")
+    .addEventListener("click", _pushSolicitarPermissao);
+  banner
+    .querySelector("#_push-btn-nao")
+    .addEventListener("click", _pushFecharBanner);
+}
+
+/**
+ * Fecha o banner de ativação com animação.
+ */
+function _pushFecharBanner() {
+  const el = document.getElementById("push-banner");
+  if (!el) return;
+  el.style.opacity = "0";
+  el.style.transform = "translateY(16px)";
+  el.style.transition = "opacity .2s, transform .2s";
+  setTimeout(() => el.remove(), 220);
+}
+
+/**
+ * Inicializa o sistema de push:
+ *  - Se já autorizado → revalida a subscription silenciosamente
+ *  - Se não autorizado → mostra o banner após 4s
+ */
+async function _pushInicializar() {
+  if (!_pushSuportado()) return;
+  if (typeof supa === "undefined") return;
+
+  // Já autorizado em sessões anteriores → recaptura silenciosamente
+  if (Notification.permission === "granted") {
+    await _pushRegistrar();
+    return;
+  }
+
+  // Se o usuário já disse "Agora não" nessa sessão, não incomoda de novo
+  if (sessionStorage.getItem("push_dismissed") === "1") return;
+
+  // Mostra o banner depois de 4s (dá tempo do app terminar de carregar)
+  setTimeout(_pushMostrarBanner, 4000);
+}
+
+// Auto-inicializa quando o DOM estiver pronto
+(function _pushAutoInit() {
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", _pushInicializar, { once: true });
+  } else {
+    _pushInicializar();
+  }
+})();

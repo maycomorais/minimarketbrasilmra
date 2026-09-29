@@ -90,6 +90,9 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (abaAtual === "pdv") carregarMonitorMesas();
     // if (abaAtual === 'financeiro') calcularFinanceiro();
     if (abaAtual === "dashboard") carregarDashboard();
+
+    // Badge do PDV: sempre atualiza, independente da aba
+    _atualizarBadgePedidosPendentes();
   }, 60000);
 
   // Verifica Login e Permissões
@@ -812,6 +815,9 @@ function iniciarRealtime() {
         if (abaAtual === "pedidos") carregarPedidos(silencioso);
         if (abaAtual === "cozinha") carregarCozinha();
         if (abaAtual === "dashboard") carregarDashboard();
+
+        // Atualiza badge do PDV em QUALQUER aba (independe de estar no PDV)
+        _atualizarBadgePedidosPendentes();
       },
     )
     .subscribe();
@@ -3353,7 +3359,176 @@ async function salvarMovimentacaoCaixa() {
   calcularFinanceiro();
 }
 
+/**
+ * Recalcula o resumo de uma sessão de caixa direto do banco.
+ * Ignora _caixaState, filtros de tela e qualquer variável JS.
+ * Chama a view vw_sessao_resumo como fonte da verdade.
+ *
+ * @param {number} sessaoId
+ * @param {string} inicioISO   — aberto_em da sessão (ISO com TZ)
+ * @param {string} fimISO      — fechado_em (ISO com TZ) ou NOW
+ * @returns {Promise<object>}  resumo completo
+ */
+async function _calcularResumoSessao(sessaoId, inicioISO, fimISO) {
+  const safeNum = (v) => {
+    if (!v) return 0;
+    if (typeof v === "number") return v;
+    return (
+      parseFloat(String(v).replace(/[^\d.,-]/g, "").replace(",", ".")) || 0
+    );
+  };
+
+  // ── 1. Consulta a view de resumo (fonte autoritativa, cálculo em SQL) ──
+  const { data: rows, error } = await supa
+    .from("vw_sessao_resumo")
+    .select("*")
+    .eq("sessao_id", sessaoId)
+    .limit(1);
+
+  if (!error && rows && rows.length > 0) {
+    const r = rows[0];
+    const faturamento    = safeNum(r.faturamento);
+    const custoEntregas  = safeNum(r.custo_entregas);
+    const totalDespesas  = safeNum(r.total_despesas);
+    const totalSangrias  = safeNum(r.total_sangrias);
+    const totalSuprimentos = safeNum(r.total_suprimentos);
+    const totalSaidas    = totalDespesas + totalSangrias;
+    const totalEfetivo   = safeNum(r.total_efetivo);
+    const valorAbertura  = safeNum(r.valor_abertura);
+    const lucroOperacional =
+      faturamento + totalSuprimentos - custoEntregas - totalSaidas;
+    const dinheiroGaveta = valorAbertura + totalSuprimentos + totalEfetivo - totalSaidas;
+
+    // Custo de combustível dos motoboys únicos nessa janela
+    let custoCombustivel = 0;
+    const motoMap = {};
+    try {
+      const { data: peds } = await supa
+        .from("pedidos")
+        .select("motoboy_id, motoboys(nome)")
+        .neq("status", "cancelado")
+        .eq("tipo_entrega", "delivery")
+        .gte("created_at", inicioISO)
+        .lte("created_at", fimISO);
+      (peds || []).forEach((p) => {
+        const nm = p.motoboys?.nome || "Sem Motoboy";
+        if (!motoMap[nm]) motoMap[nm] = true;
+      });
+      delete motoMap["Sem Motoboy"];
+      custoCombustivel = (AJUDA_COMBUSTIVEL || 0) * Object.keys(motoMap).length;
+    } catch (_) {
+      custoCombustivel = 0;
+    }
+
+    return {
+      sessao_id:         r.sessao_id,
+      usuario_email:     r.usuario_email,
+      usuario_nome:      r.usuario_nome,
+      aberto_em:         r.aberto_em,
+      fechado_em:        r.fechado_em,
+      valor_abertura:    valorAbertura,
+
+      faturamento,
+      qtd_pedidos:       safeNum(r.qtd_pedidos),
+      custo_entregas:    custoEntregas + custoCombustivel,
+      custo_combustivel: custoCombustivel,
+      total_despesas:    totalDespesas,
+      total_sangrias:    totalSangrias,
+      total_suprimentos: totalSuprimentos,
+      total_saidas:      totalSaidas,
+      total_entradas:    totalSuprimentos,
+      lucro_operacional: lucroOperacional,
+      dinheiro_gaveta:   dinheiroGaveta,
+
+      total_efetivo:      totalEfetivo,
+      total_pix:          safeNum(r.total_pix),
+      total_cartao:       safeNum(r.total_cartao),
+      total_cartao_br:    safeNum(r.total_cartao_br),
+      total_transferencia:safeNum(r.total_transferencia),
+      total_qr_py:        safeNum(r.total_qr_py),
+      total_multi_outros: safeNum(r.total_multi_outros),
+    };
+  }
+
+  // ── 2. Fallback: se a view não existir (deploy sem rodar o SQL) ──
+  //     Recalcula em JS direto dos pedidos + movimentações.
+  console.warn(
+    "[_calcularResumoSessao] View vw_sessao_resumo indisponível — usando cálculo em JS.",
+  );
+
+  const { data: pedidos } = await supa
+    .from("pedidos")
+    .select("total_geral, frete_motoboy, forma_pagamento, tipo_entrega")
+    .neq("status", "cancelado")
+    .gte("created_at", inicioISO)
+    .lte("created_at", fimISO);
+
+  const peds = pedidos || [];
+  let faturamento = 0, custoEntregas = 0;
+  let totalEfetivo = 0, totalPix = 0, totalCartao = 0;
+  let totalCartaoBR = 0, totalTransf = 0, totalQrPy = 0, totalMulti = 0;
+
+  peds.forEach((p) => {
+    const val = safeNum(p.total_geral);
+    faturamento += val;
+    if (p.tipo_entrega === "delivery")
+      custoEntregas += safeNum(p.frete_motoboy);
+    const pag = (p.forma_pagamento || "").toLowerCase();
+    if (pag.includes("efetivo") || pag.includes("dinheiro")) totalEfetivo += val;
+    else if (pag.includes("pix")) totalPix += val;
+    else if (pag === "cartaobr") totalCartaoBR += val;
+    else if (pag.includes("cartao") || pag.includes("cartão")) totalCartao += val;
+    else if (pag.includes("transfer") || pag.includes("alias")) totalTransf += val;
+    else if (pag === "qrpy") totalQrPy += val;
+    else totalMulti += val;
+  });
+
+  const { data: movs } = await supa
+    .from("movimentacoes_caixa")
+    .select("tipo, valor")
+    .eq("sessao_id", sessaoId);
+
+  let totalDespesas = 0, totalSangrias = 0, totalSuprimentos = 0;
+  (movs || []).forEach((m) => {
+    const v = safeNum(m.valor);
+    if (m.tipo === "despesa") totalDespesas += v;
+    if (m.tipo === "sangria") totalSangrias += v;
+    if (m.tipo === "suprimento" || m.tipo === "abertura")
+      totalSuprimentos += v;
+  });
+
+  const totalSaidas = totalDespesas + totalSangrias;
+  const lucroOperacional =
+    faturamento + totalSuprimentos - custoEntregas - totalSaidas;
+
+  return {
+    sessao_id: sessaoId,
+    aberto_em: inicioISO,
+    fechado_em: fimISO,
+    valor_abertura: 0,
+    faturamento,
+    qtd_pedidos: peds.length,
+    custo_entregas: custoEntregas,
+    custo_combustivel: 0,
+    total_despesas: totalDespesas,
+    total_sangrias: totalSangrias,
+    total_suprimentos: totalSuprimentos,
+    total_saidas: totalSaidas,
+    total_entradas: totalSuprimentos,
+    lucro_operacional: lucroOperacional,
+    dinheiro_gaveta: totalSuprimentos + totalEfetivo - totalSaidas,
+    total_efetivo: totalEfetivo,
+    total_pix: totalPix,
+    total_cartao: totalCartao,
+    total_cartao_br: totalCartaoBR,
+    total_transferencia: totalTransf,
+    total_qr_py: totalQrPy,
+    total_multi_outros: totalMulti,
+  };
+}
+
 async function fecharCaixaResumo() {
+  // ── Guard: existe sessão aberta? ────────────────────────────────
   if (!_sessaoCaixaAtiva) {
     alert("Nenhum caixa aberto para fechar.");
     return;
@@ -3361,116 +3536,208 @@ async function fecharCaixaResumo() {
 
   if (
     !confirm(
-      "Fechar o caixa desta sessão?\nIsso encerra a sessão e registra o fechamento.",
+      "Fechar o caixa desta sessão?\nIsso encerra a sessão e registra o fechamento no histórico.",
     )
   )
     return;
 
-  await calcularFinanceiro(); // garante que _caixaState está atualizado
-  const s = _caixaState;
-  const fmt = (n) => "Gs " + n.toLocaleString("es-PY");
-  const lucro =
-    s.faturamento + s.totalEntradas - s.custoEntregas - s.totalSaidas;
+  // ── 1. Captura dados da sessão ANTES de qualquer operação ────────
+  //     (evita race condition com _carregarSessaoCaixa zerando a var)
+  const sessaoId      = _sessaoCaixaAtiva.id;
+  const abertoEm      = _sessaoCaixaAtiva.aberto_em;
+  const valorAbertura = Number(_sessaoCaixaAtiva.valor_abertura || 0);
+  const emailAtual    = document.getElementById("user-email")?.innerText || "admin";
+  const nomeAtual     = document.getElementById("user-nome-display")?.innerText || emailAtual;
+  const fechadoEm     = new Date().toISOString();
+
+  // ── 2. Feedback visual durante o cálculo ────────────────────────
+  const _btnFechar = document.querySelector('[onclick="fecharCaixaResumo()"]');
+  const _textOrigBtn = _btnFechar ? _btnFechar.innerHTML : "";
+  if (_btnFechar) {
+    _btnFechar.disabled = true;
+    _btnFechar.innerHTML = "⏳ Calculando fechamento...";
+    _btnFechar.style.opacity = "0.65";
+  }
+
+  const fmt = (n) => "Gs " + Math.round(n).toLocaleString("es-PY");
 
   try {
-    // 1. Marca a sessão como fechada
-    await supa
+    // ── 3. Recalcula tudo do banco (fonte autoritativa) ───────────
+    const r = await _calcularResumoSessao(sessaoId, abertoEm, fechadoEm);
+
+    // ── 4. Salva snapshot em caixa_fechamentos ────────────────────
+    const detalhesJSON = {
+      gerado_por: "admin.js:fecharCaixaResumo",
+      versao:     "1.0",
+      calculo:    "view_vw_sessao_resumo",
+    };
+
+    const { error: errSnap } = await supa
+      .from("caixa_fechamentos")
+      .insert([{
+        sessao_id:          sessaoId,
+        usuario_email:      emailAtual,
+        usuario_nome:       nomeAtual,
+        aberto_em:          abertoEm,
+        fechado_em:         fechadoEm,
+        valor_abertura:     valorAbertura,
+        faturamento:        r.faturamento,
+        qtd_pedidos:        r.qtd_pedidos,
+        custo_entregas:     r.custo_entregas,
+        total_despesas:     r.total_despesas,
+        total_sangrias:     r.total_sangrias,
+        total_suprimentos:  r.total_suprimentos,
+        lucro_operacional:  r.lucro_operacional,
+        dinheiro_gaveta:    r.dinheiro_gaveta,
+        total_efetivo:      r.total_efetivo,
+        total_pix:          r.total_pix,
+        total_cartao:       r.total_cartao,
+        total_cartao_br:    r.total_cartao_br,
+        total_transferencia:r.total_transferencia,
+        total_qr_py:        r.total_qr_py,
+        total_multi_outros: r.total_multi_outros,
+        detalhes:           detalhesJSON,
+      }]);
+
+    if (errSnap) {
+      console.error("[fecharCaixaResumo] Erro ao salvar snapshot:", errSnap.message);
+      alert(
+        "⚠️ Sessão será fechada, mas não foi possível salvar o snapshot do fechamento:\n\n" +
+        errSnap.message +
+        "\n\nVerifique se a migration SQL da tabela caixa_fechamentos foi executada."
+      );
+    }
+
+    // ── 5. Marca a sessão como fechada em sessoes_caixa ───────────
+    const { error: errSess } = await supa
       .from("sessoes_caixa")
       .update({
-        fechado_em: new Date().toISOString(),
-        valor_fechamento: lucro,
-        observacao: `Fat: ${fmt(s.faturamento)} | Res: ${fmt(lucro)}`,
+        fechado_em:       fechadoEm,
+        valor_fechamento: r.lucro_operacional,
+        observacao:
+          `Fat: ${fmt(r.faturamento)} | Res: ${fmt(r.lucro_operacional)}`,
       })
-      .eq("id", _sessaoCaixaAtiva.id);
+      .eq("id", sessaoId);
 
-    // 2. Registra movimentação de fechamento vinculada à sessão
-    await supa.from("movimentacoes_caixa").insert([
-      {
-        tipo: "fechamento",
-        valor: lucro,
-        descricao: `Fechamento ${new Date().toLocaleDateString("pt-BR")} | Fat: ${fmt(s.faturamento)} | Res: ${fmt(lucro)}`,
-        usuario_email:
-          document.getElementById("user-email")?.innerText || "admin",
-        sessao_id: _sessaoCaixaAtiva.id,
-      },
-    ]);
-  } catch (e) {
-    console.warn("Aviso fechamento:", e.message);
-  }
+    if (errSess) {
+      console.error("[fecharCaixaResumo] Erro ao fechar sessão:", errSess.message);
+      alert("❌ Não foi possível fechar a sessão: " + errSess.message);
+      return;
+    }
 
-  alert(`📊 FECHAMENTO DA SESSÃO #${_sessaoCaixaAtiva.id}
+    // ── 6. Registra movimentação de fechamento ────────────────────
+    await supa
+      .from("movimentacoes_caixa")
+      .insert([{
+        tipo:          "fechamento",
+        valor:         r.lucro_operacional,
+        descricao:
+          `Fechamento ${new Date().toLocaleDateString("pt-BR")} | Fat: ${fmt(r.faturamento)} | Res: ${fmt(r.lucro_operacional)}`,
+        usuario_email: emailAtual,
+        sessao_id:     sessaoId,
+      }]);
+
+    // ── 7. Alerta final (usa os valores recém-calculados, não globais) ─
+    const totalEntradasLabel = r.total_suprimentos;
+    alert(
+      `📊 FECHAMENTO DA SESSÃO #${sessaoId}
 ═══════════════════════════
-Faturamento Total: ${fmt(s.faturamento)}
-💰 Lucro s/ Vendas: ${fmt(s.lucroBrutoVendas || 0)}${s.markupMedioVendas ? ` (markup ${s.markupMedioVendas}%)` : ""}${s.coberturaLucroPct !== null && s.coberturaLucroPct < 95 ? `
-⚠️ Cálculo cobre ${s.coberturaLucroPct}% das vendas (${s.qtdItensSemCusto} item(s) sem "preço de compra" cadastrado, totalizando ${fmt(s.faturamentoSemCusto)})` : ""}
+Período: ${new Date(abertoEm).toLocaleString("pt-BR")} → ${new Date(fechadoEm).toLocaleString("pt-BR")}
+
+Faturamento Total: ${fmt(r.faturamento)}
+📦 Pedidos: ${r.qtd_pedidos}
 
 💰 Por Método:
-  💵 Dinheiro:      ${fmt(s.totalEfetivo)}
-  📱 Pix:           ${fmt(s.totalPix)}
-  💳 Cartão PY:     ${fmt(s.totalCartao)}
-  💳 Cartão BR:     ${fmt(s.totalCartaoBR)}
-  🏦 Transferência: ${fmt(s.totalTransf)}
-  📲 QR Paraguay:   ${fmt(s.totalQrPy)}
-${s.totalMultiOutros > 0 ? `  🔀 Multi/Outros:  ${fmt(s.totalMultiOutros)}\n` : ""}\
-📦 Pedidos: ${s.qtdPedidos}
-🏍️ Custo Entregas: ${fmt(s.custoEntregas)}
-💸 Saídas (despesas/sangrias): ${fmt(s.totalSaidas)}
-➕ Entradas (suprimentos): ${fmt(s.totalEntradas)}
-═══════════════════════════
-💵 RESULTADO OPERACIONAL: ${fmt(lucro)}
-═══════════════════════════
-🏦 Abertura de caixa:    ${fmt(_sessaoCaixaAtiva.valor_abertura || 0)}
-💵 Vendas em dinheiro:   ${fmt(s.totalEfetivo)}
-💸 Saídas em dinheiro:   ${fmt(s.totalSaidas)}
-──────────────────────────
-💰 DINHEIRO NA GAVETA:   ${fmt((_sessaoCaixaAtiva.valor_abertura || 0) + s.totalEfetivo - s.totalSaidas)}
-Sessão encerrada!`);
-
-  // Limpa estado
-  _sessaoCaixaAtiva = null;
-  [
-    "card-faturamento",
-    "card-custo-moto",
-    "card-lucro",
-    "card-lucro-vendas",
-    "total-pix",
-    "total-transf",
-    "total-cartao",
-    "total-efetivo",
-    "card-ticket-medio",
-  ].forEach((id) => {
-    const el = document.getElementById(id);
-    if (el) el.innerText = "Gs 0";
-  });
-  const _clvPctReset = document.getElementById("card-lucro-vendas-pct");
-  if (_clvPctReset) {
-    _clvPctReset.textContent = "—";
-    _clvPctReset.style.color = "";
+  💵 Dinheiro:      ${fmt(r.total_efetivo)}
+  📱 Pix:           ${fmt(r.total_pix)}
+  💳 Cartão PY:     ${fmt(r.total_cartao)}
+  💳 Cartão BR:     ${fmt(r.total_cartao_br)}
+  🏦 Transferência: ${fmt(r.total_transferencia)}
+  📲 QR Paraguay:   ${fmt(r.total_qr_py)}${
+    r.total_multi_outros > 0
+      ? `\n  🔀 Multi/Outros:  ${fmt(r.total_multi_outros)}`
+      : ""
   }
-  const qEl = document.getElementById("card-qtd-pedidos");
-  if (qEl) qEl.innerText = "0";
-  _caixaState = {
-    faturamento: 0,
-    custoEntregas: 0,
-    totalSaidas: 0,
-    totalEntradas: 0,
-    totalPix: 0,
-    totalTransf: 0,
-    totalCartao: 0,
-    totalEfetivo: 0,
-    totalQrPy: 0,
-    totalCartaoBR: 0,
-    totalMultiOutros: 0,
-    qtdPedidos: 0,
-    lucroBrutoVendas: 0,
-    markupMedioVendas: null,
-  };
 
-  // Atualiza indicador global e painel PDV
-  const elStatusGlobal = document.getElementById("status-sessao-caixa");
-  if (elStatusGlobal)
-    elStatusGlobal.innerHTML = `<span style="color:#e74c3c">🔴 Nenhum caixa aberto</span>`;
-  _pdvAtualizarPainelCaixa();
+🏍️ Custo Entregas: ${fmt(r.custo_entregas)}
+💸 Despesas:       ${fmt(r.total_despesas)}
+💸 Sangrias:       ${fmt(r.total_sangrias)}
+➕ Suprimentos:    ${fmt(totalEntradasLabel)}
+═══════════════════════════
+💵 RESULTADO OPERACIONAL: ${fmt(r.lucro_operacional)}
+═══════════════════════════
+🏦 Abertura de caixa:    ${fmt(valorAbertura)}
+💵 Vendas em dinheiro:   ${fmt(r.total_efetivo)}
+💸 Saídas em dinheiro:   ${fmt(r.total_despesas + r.total_sangrias)}
+──────────────────────────
+💰 DINHEIRO NA GAVETA:   ${fmt(r.dinheiro_gaveta)}
+═══════════════════════════
+Sessão encerrada com sucesso.`
+    );
+
+    // ── 8. Limpa estado local e atualiza UI ───────────────────────
+    _sessaoCaixaAtiva = null;
+
+    [
+      "card-faturamento",
+      "card-custo-moto",
+      "card-lucro",
+      "card-lucro-vendas",
+      "total-pix",
+      "total-transf",
+      "total-cartao",
+      "total-efetivo",
+      "card-ticket-medio",
+    ].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.innerText = "Gs 0";
+    });
+    const _clvPctReset = document.getElementById("card-lucro-vendas-pct");
+    if (_clvPctReset) {
+      _clvPctReset.textContent = "—";
+      _clvPctReset.style.color = "";
+    }
+    const qEl = document.getElementById("card-qtd-pedidos");
+    if (qEl) qEl.innerText = "0";
+
+    _caixaState = {
+      faturamento: 0,
+      custoEntregas: 0,
+      totalSaidas: 0,
+      totalEntradas: 0,
+      totalPix: 0,
+      totalTransf: 0,
+      totalCartao: 0,
+      totalEfetivo: 0,
+      totalQrPy: 0,
+      totalCartaoBR: 0,
+      totalMultiOutros: 0,
+      qtdPedidos: 0,
+      lucroBrutoVendas: 0,
+      markupMedioVendas: null,
+    };
+
+    // Atualiza indicadores globais
+    const elStatusGlobal = document.getElementById("status-sessao-caixa");
+    if (elStatusGlobal) {
+      elStatusGlobal.innerHTML =
+        `<span style="color:#e74c3c">🔴 Nenhum caixa aberto</span>`;
+    }
+    _pdvAtualizarPainelCaixa();
+
+    // Recarrega o financeiro (sem sessão ativa → mostra pedidos do período atual)
+    await calcularFinanceiro();
+
+  } catch (e) {
+    console.error("[fecharCaixaResumo] Erro inesperado:", e);
+    alert("❌ Erro inesperado ao fechar caixa: " + e.message);
+  } finally {
+    if (_btnFechar) {
+      _btnFechar.disabled = false;
+      _btnFechar.innerHTML = _textOrigBtn;
+      _btnFechar.style.opacity = "1";
+    }
+  }
 }
 
 // =========================================
@@ -4301,7 +4568,7 @@ function renderizarCardsProdutos(lista) {
       padding:8px 14px; margin-bottom:8px;
       box-shadow:0 1px 4px rgba(0,0,0,0.06);
     `;
-    barraAcoes.innerHTML = `
+            barraAcoes.innerHTML = `
       <span id="pt-bulk-count" style="font-size:0.82rem;font-weight:700;color:#334155"></span>
       <button onclick="ptBulkPausar()" style="
         padding:6px 14px;background:#f97316;color:#fff;border:none;border-radius:7px;
@@ -4312,6 +4579,22 @@ function renderizarCardsProdutos(lista) {
         padding:6px 14px;background:#22c55e;color:#fff;border:none;border-radius:7px;
         font-size:0.8rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:5px">
         <i class="fas fa-play"></i> Despausar
+      </button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.78rem;color:#64748b;font-weight:600">
+        <i class="fas fa-ruler-horizontal" style="color:#94a3b8"></i>
+        <select id="pt-bulk-label-width"
+          onchange="_setLabelSize(this.value)"
+          style="padding:5px 8px;border:1px solid #e2e8f0;border-radius:7px;font-size:0.78rem;background:#fff;color:#334155;cursor:pointer;font-weight:600">
+          <option value="48">48 mm</option>
+          <option value="58">58 mm</option>
+          <option value="72">72 mm</option>
+          <option value="80">80 mm</option>
+        </select>
+      </label>
+      <button onclick="imprimirEtiquetasEmMassa()" style="
+        padding:6px 14px;background:#2563eb;color:#fff;border:none;border-radius:7px;
+        font-size:0.8rem;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:5px">
+        <i class="fas fa-print"></i> Imprimir Etiquetas
       </button>
       <button onclick="ptBulkExcluir()" style="
         padding:6px 14px;background:#ef4444;color:#fff;border:none;border-radius:7px;
@@ -4324,6 +4607,14 @@ function renderizarCardsProdutos(lista) {
         ✕ Desmarcar todos
       </button>
     `;
+
+    // Restaura a última largura escolhida pelo usuário
+    const _selWidth = document.getElementById("pt-bulk-label-width");
+    if (_selWidth) {
+      _selWidth.value = String(
+        localStorage.getItem(_LABEL_SIZE_STORAGE_KEY) || _LABEL_SIZE_DEFAULT,
+      );
+    }
     grid.parentNode.insertBefore(barraAcoes, grid);
   }
 
@@ -8858,6 +9149,10 @@ async function carregarPDV() {
   atualizarBarraMesasAtivas();
   pdvIniciarTabs();
 
+  // ── Alerta de pedidos pendentes + badge no menu ────────────────
+  _injetarBadgeNoMenuPDV();
+  await _atualizarBadgePedidosPendentes();
+
   _pdvRealocarBuscaParaTopo();
 }
 
@@ -10654,6 +10949,93 @@ function limparCarrinhoPDV() {
   _pdvToast("🗑️ Carrinho limpo.");
 }
 
+/**
+ * Verifica se há uma sessão de caixa aberta no momento.
+ * Faz consulta ao banco (não confia apenas no cache em memória)
+ * para evitar vendas com caixa fechado em outra aba/dispositivo.
+ *
+ * @returns {Promise<{ aberto: boolean, sessao?: object }>}
+ */
+async function _pdvCaixaEstaAberto() {
+  try {
+    const { data } = await supa
+      .from("sessoes_caixa")
+      .select("id, usuario_email, aberto_em, valor_abertura")
+      .is("fechado_em", null)
+      .order("aberto_em", { ascending: false })
+      .limit(1);
+
+    if (data && data.length > 0) {
+      // Sincroniza o cache em memória com o banco
+      _sessaoCaixaAtiva = data[0];
+      return { aberto: true, sessao: data[0] };
+    }
+    _sessaoCaixaAtiva = null;
+    return { aberto: false };
+  } catch (e) {
+    console.warn("[_pdvCaixaEstaAberto] Falha ao consultar sessão:", e.message);
+    // Em caso de erro de rede, confia no cache (evita bloquear venda legítima)
+    return { aberto: !!_sessaoCaixaAtiva, sessao: _sessaoCaixaAtiva };
+  }
+}
+
+/**
+ * Exibe modal de aviso quando o caixa está fechado.
+ * Reutiliza o padrão visual dos modais existentes.
+ */
+function _pdvMostrarBloqueioCaixaFechado() {
+  // Se já existe modal aberto, não duplica
+  if (document.getElementById("_modal-caixa-fechado")) return;
+
+  const overlay = document.createElement("div");
+  overlay.id = "_modal-caixa-fechado";
+  overlay.style.cssText = [
+    "position:fixed",
+    "inset:0",
+    "background:rgba(0,0,0,0.6)",
+    "z-index:99999",
+    "display:flex",
+    "align-items:center",
+    "justify-content:center",
+    "padding:16px",
+  ].join(";");
+
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:18px;padding:28px 24px;max-width:400px;width:100%;text-align:center;box-shadow:0 24px 60px rgba(0,0,0,0.3)">
+      <div style="font-size:3rem;margin-bottom:12px">🔒</div>
+      <h3 style="margin:0 0 8px;font-size:1.15rem;color:#1a1a1a">Caixa fechado</h3>
+      <p style="margin:0 0 20px;font-size:0.92rem;color:#555;line-height:1.55">
+        É necessário <strong>abrir o caixa</strong> antes de registrar vendas no PDV.
+        Isso garante que as movimentações sejam contabilizadas corretamente na sessão.
+      </p>
+      <div style="display:flex;gap:10px;flex-direction:column">
+        <button id="_btn-abrir-caixa-modal"
+          style="padding:14px;background:linear-gradient(135deg,#1a7a2e,#145a22);color:#fff;border:none;border-radius:10px;font-size:0.95rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px">
+          <i class="fas fa-door-open"></i> Abrir Caixa Agora
+        </button>
+        <button id="_btn-fechar-modal-caixa"
+          style="padding:11px;background:transparent;color:#888;border:none;font-size:0.85rem;cursor:pointer">
+          Continuar sem vender
+        </button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  overlay
+    .querySelector("#_btn-abrir-caixa-modal")
+    .addEventListener("click", () => {
+      overlay.remove();
+      abrirModalCaixa("abertura");
+    });
+  overlay
+    .querySelector("#_btn-fechar-modal-caixa")
+    .addEventListener("click", () => {
+      overlay.remove();
+    });
+}
+
 function pdvAlterarQtd(idx, delta) {
   const item = carrinhoPDV[idx];
   if (!item) return;
@@ -11056,6 +11438,268 @@ function _coletarMultiPagamentoPDV() {
   return partes;
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  SISTEMA DE IMPRESSÃO DO PDV
+//  Modos persistidos em localStorage:
+//    "ask"    → pergunta sempre (padrão)
+//    "always" → imprime automaticamente sem perguntar
+//    "never"  → nunca imprime automaticamente
+// ═══════════════════════════════════════════════════════════════
+
+const _PDV_PRINT_MODE_KEY = "pdv_print_mode";
+const _PDV_PRINT_MODE_DEFAULT = "ask";
+
+/**
+ * Retorna o modo de impressão configurado.
+ * @returns {"ask"|"always"|"never"}
+ */
+function _pdvGetPrintMode() {
+  const m = localStorage.getItem(_PDV_PRINT_MODE_KEY);
+  if (m === "always" || m === "never" || m === "ask") return m;
+  return _PDV_PRINT_MODE_DEFAULT;
+}
+
+/**
+ * Salva o modo de impressão e atualiza o chip visual no header.
+ */
+function _pdvSetPrintMode(mode) {
+  if (mode !== "always" && mode !== "never" && mode !== "ask") return;
+  localStorage.setItem(_PDV_PRINT_MODE_KEY, mode);
+  _pdvRenderPrintModeChip();
+}
+
+/**
+ * Reseta para o modo "pergunta sempre".
+ */
+function _pdvResetPrintMode() {
+  localStorage.removeItem(_PDV_PRINT_MODE_KEY);
+  _pdvRenderPrintModeChip();
+}
+
+/**
+ * Monta o objeto de dados que o imprimir.html espera.
+ * Recebe um contexto com os dados da venda do PDV.
+ */
+function _pdvGerarDadosImpressao(ctx) {
+  return {
+    id: ctx.pedidoId,
+    cliente: { nome: ctx.clienteNome, tel: ctx.clienteTel },
+    entrega: { tipo: "balcao", ref: ctx.entregaRef },
+    itens: (ctx.itens || []).map((i) => ({
+      q: i.qtd || 1,
+      n: i.nome,
+      p: i.preco,
+      t: i.variacao || "",
+      pr: i.preparo || "",
+      m: i.montagem || [],
+      o: i.obs || "",
+      peso_gramas: i.peso_gramas,
+      _isKg: i._isKg,
+    })),
+    valores: {
+      sub: ctx.subtotalBruto,
+      desconto: ctx.descontoAplicado,
+      frete: ctx.fretePDV,
+      total: ctx.totalNovo,
+    },
+    pagamento: { metodo: ctx.formaPagamento, obs: ctx.obsPagamento },
+    data: new Date().toLocaleString("pt-BR"),
+  };
+}
+
+/**
+ * Abre a janela de impressão do comprovante.
+ * Isolado numa função para poder ser chamado tanto pelo modal
+ * quanto pelo modo "automático" (sempre imprime).
+ */
+function _pdvImprimirComprovante(dadosImpressao) {
+  try {
+    const base64 = btoa(
+      unescape(encodeURIComponent(JSON.stringify(dadosImpressao))),
+    )
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    window.open(
+      `imprimir.html?d=${base64}`,
+      "PrintPDV",
+      "width=400,height=600",
+    );
+  } catch (e) {
+    console.error("[_pdvImprimirComprovante] Erro:", e);
+    alert("Erro ao abrir a janela de impressão: " + e.message);
+  }
+}
+
+/**
+ * Ponto de entrada após cada venda no PDV.
+ * Respeita o modo configurado (ask / always / never).
+ */
+function _pdvPerguntarImpressao(dadosImpressao) {
+  const mode = _pdvGetPrintMode();
+  if (mode === "always") {
+    _pdvImprimirComprovante(dadosImpressao);
+    return;
+  }
+  if (mode === "never") {
+    return;
+  }
+  _pdvMostrarModalImpressao(dadosImpressao);
+}
+
+/**
+ * Mostra o modal "Imprimir comprovante?".
+ * Reutiliza o mesmo overlay — não duplica se já estiver aberto.
+ */
+function _pdvMostrarModalImpressao(dadosImpressao) {
+  document.getElementById("_pdv-modal-print")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.id = "_pdv-modal-print";
+  overlay.style.cssText = [
+    "position:fixed",
+    "inset:0",
+    "background:rgba(0,0,0,0.6)",
+    "z-index:99999",
+    "display:flex",
+    "align-items:center",
+    "justify-content:center",
+    "padding:16px",
+  ].join(";");
+
+  const totalFmt = (dadosImpressao.valores?.total || 0).toLocaleString("es-PY");
+  const clienteNome = dadosImpressao.cliente?.nome || "Cliente";
+  const qtdItens = (dadosImpressao.itens || []).length;
+
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:18px;padding:26px 24px;max-width:400px;width:100%;box-shadow:0 24px 60px rgba(0,0,0,0.35);text-align:center">
+      <div style="font-size:2.5rem;margin-bottom:8px">🖨️</div>
+      <h3 style="margin:0 0 4px;font-size:1.15rem;color:#1a1a1a">Imprimir comprovante?</h3>
+      <div style="font-size:0.82rem;color:#888;margin-bottom:16px">
+        Pedido <strong>#${dadosImpressao.id}</strong> — ${clienteNome}
+      </div>
+
+      <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;margin-bottom:18px;text-align:left">
+        <div style="display:flex;justify-content:space-between;font-size:0.85rem;color:#555;margin-bottom:4px">
+          <span>Itens:</span>
+          <strong>${qtdItens}</strong>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:1.05rem;color:#1a1a1a;font-weight:800;border-top:1px dashed #cbd5e1;padding-top:6px;margin-top:6px">
+          <span>Total:</span>
+          <span>Gs ${totalFmt}</span>
+        </div>
+      </div>
+
+      <label style="display:flex;align-items:center;gap:8px;margin-bottom:16px;cursor:pointer;justify-content:center;font-size:0.82rem;color:#64748b">
+        <input type="checkbox" id="_pdv-print-lembrar" style="width:16px;height:16px;accent-color:#1a7a2e">
+        Lembrar minha escolha
+      </label>
+
+      <div style="display:flex;gap:10px;flex-direction:column">
+        <button id="_pdv-print-sim"
+          style="padding:14px;background:linear-gradient(135deg,#1a7a2e,#145a22);color:#fff;border:none;border-radius:10px;font-size:0.95rem;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px">
+          <i class="fas fa-print"></i> Imprimir comprovante
+        </button>
+        <button id="_pdv-print-nao"
+          style="padding:12px;background:#f1f5f9;color:#475569;border:1px solid #e2e8f0;border-radius:10px;font-size:0.9rem;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px">
+          <i class="fas fa-times"></i> Não imprimir
+        </button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  const fechar = () => overlay.remove();
+
+  overlay.querySelector("#_pdv-print-sim").addEventListener("click", () => {
+    const lembrar = overlay.querySelector("#_pdv-print-lembrar").checked;
+    if (lembrar) _pdvSetPrintMode("always");
+    fechar();
+    _pdvImprimirComprovante(dadosImpressao);
+  });
+
+  overlay.querySelector("#_pdv-print-nao").addEventListener("click", () => {
+    const lembrar = overlay.querySelector("#_pdv-print-lembrar").checked;
+    if (lembrar) _pdvSetPrintMode("never");
+    fechar();
+  });
+
+  const _keyHandler = (e) => {
+    if (e.key === "Escape") {
+      document.removeEventListener("keydown", _keyHandler);
+      fechar();
+    }
+  };
+  document.addEventListener("keydown", _keyHandler);
+}
+
+/**
+ * Chip de status no header do PDV.
+ * Só aparece quando o modo NÃO é "ask" (ou seja, quando o
+ * operador já escolheu lembrar). Clicar reseta para perguntar.
+ */
+function _pdvRenderPrintModeChip() {
+  const headerBar = document.querySelector(".pdv-header-bar");
+  if (!headerBar) return;
+
+  let chip = document.getElementById("_pdv-print-mode-chip");
+  const mode = _pdvGetPrintMode();
+
+  if (mode === "ask") {
+    if (chip) chip.remove();
+    return;
+  }
+
+  if (!chip) {
+    chip = document.createElement("button");
+    chip.id = "_pdv-print-mode-chip";
+    chip.type = "button";
+    chip.style.cssText = [
+      "background:#f1f5f9",
+      "border:1px solid #cbd5e1",
+      "color:#475569",
+      "padding:6px 12px",
+      "border-radius:8px",
+      "font-size:0.78rem",
+      "font-weight:700",
+      "cursor:pointer",
+      "display:flex",
+      "align-items:center",
+      "gap:6px",
+      "transition:background 0.15s",
+    ].join(";");
+    chip.title = "Clique para voltar a perguntar sempre";
+    chip.addEventListener("mouseenter", () => {
+      chip.style.background = "#e2e8f0";
+    });
+    chip.addEventListener("mouseleave", () => {
+      chip.style.background = "#f1f5f9";
+    });
+    chip.addEventListener("click", () => {
+      if (
+        confirm(
+          "Voltar a perguntar sempre?\n\nO PDV vai mostrar o modal de impressão a cada venda.",
+        )
+      ) {
+        _pdvResetPrintMode();
+      }
+    });
+    headerBar.appendChild(chip);
+  }
+
+  if (mode === "always") {
+    chip.innerHTML = `<i class="fas fa-print"></i> Impressão: automática`;
+  } else {
+    chip.innerHTML = `<i class="fas fa-eye-slash"></i> Impressão: desligada`;
+  }
+}
+
+// Auto-init do chip ao carregar
+document.addEventListener("DOMContentLoaded", () => {
+  _pdvRenderPrintModeChip();
+});
+
 // ── trava anti-duplo-clique do PDV ─────────────────────────────────────
 let _pdvEnviando = false;
 
@@ -11085,13 +11729,20 @@ async function salvarPedidoBalcao() {
   // Envolve o corpo da função em try/finally para garantir liberação
   try {
 
-  if (carrinhoPDV.length === 0 && !window._mesaAbertaId) {
+    if (carrinhoPDV.length === 0 && !window._mesaAbertaId) {
     alert(t("alert.carrinho_vazio"));
     return;
   }
   if (carrinhoPDV.length === 0 && window._mesaAbertaId) {
     alert("Adicione ao menos 1 novo item antes de lançar.");
     return;
+  }
+
+  // ── TRAVA: verifica caixa aberto no banco antes de vender ──────
+  const _caixaStatus = await _pdvCaixaEstaAberto();
+  if (!_caixaStatus.aberto) {
+    _pdvMostrarBloqueioCaixaFechado();
+    return; // não libera o envio
   }
 
   const _soKg = carrinhoPDV.length > 0 && carrinhoPDV.every((i) => i._isKg);
@@ -11382,44 +12033,22 @@ async function salvarPedidoBalcao() {
     await crmGerarCashback(tel, totalNovo, novoPedido?.id || null);
   }
 
-  // ── Impressão automática ───────────────────────────────────────
+    // ── Impressão do comprovante (pergunta, automático ou silencioso) ──
   if (novoPedido?.id) {
-    // Monta dados direto (sem segunda busca no banco)
-    const dadosImpressao = {
-      id: novoPedido.id,
-      cliente: { nome: nomeFinal, tel: tel },
-      entrega: { tipo: "balcao", ref: pedido.endereco_entrega },
-      itens: novosItens.map((i) => ({
-        q: i.qtd || 1,
-        n: i.nome,
-        p: i.preco,
-        t: i.variacao || "",
-        pr: i.preparo || "",
-        m: i.montagem || [],
-        o: i.obs || "",
-        peso_gramas: i.peso_gramas,
-        _isKg: i._isKg,
-      })),
-      valores: {
-        sub: subtotalBruto,
-        desconto: descontoAplicado,
-        frete: fretePDV,
-        total: totalNovo,
-      },
-      pagamento: { metodo: pag, obs: obsPagPDV },
-      data: new Date().toLocaleString("pt-BR"),
-    };
-    const base64 = btoa(
-      unescape(encodeURIComponent(JSON.stringify(dadosImpressao))),
-    )
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-    window.open(
-      `imprimir.html?d=${base64}`,
-      "PrintPDV",
-      "width=400,height=600",
-    );
+    const dadosImpressao = _pdvGerarDadosImpressao({
+      pedidoId: novoPedido.id,
+      clienteNome: nomeFinal,
+      clienteTel: tel,
+      entregaRef: pedido.endereco_entrega,
+      itens: novosItens,
+      subtotalBruto,
+      descontoAplicado,
+      fretePDV,
+      totalNovo,
+      formaPagamento: pag,
+      obsPagamento: obsPagPDV,
+    });
+    _pdvPerguntarImpressao(dadosImpressao);
   }
 
   carrinhoPDV = [];
@@ -16910,194 +17539,343 @@ async function impexpSalvar() {
 }
 
 /**
- * Imprime etiqueta de prateleira 58mm.
- * @param {string} codigo      — código de barras (EAN)
- * @param {string} nomeProduto
- * @param {string} preco       — "Gs 12.000" (formato já pronto do card)
- * @param {number} produtoId   — opcional; se passado, busca faixas no _produtosMap
+ * Gera o HTML de UMA etiqueta de produto.
+ * Otimizado para impressora térmica 48mm:
+ *   • 100% texto preto — nada de cinza (#666) ou cores invertidas
+ *   • Layout compacto, sem bordas externas (aproveita o gap da bobina)
+ *   • Suporta 3 modos de preço: tiers (varejo/atacado), preço único, ou sem preço
+ *
+ * @param {object} produto
+ * @param {number} index   — usado para gerar ID único do SVG do barcode
+ * @returns {string} HTML da etiqueta
  */
-function imprimirCodigoBarras(codigo, nomeProduto, preco, produtoId) {
-  // Busca o produto no cache para obter faixas e imagem
-  let produto = null;
-  if (produtoId && typeof _produtosMap !== "undefined") {
-    produto = _produtosMap[produtoId];
-  }
-  const cfg = produto ? vfBuscarConfigFaixa(produto) : null;
-  const imgUrl = produto?.imagem_url || "";
 
-  // Monta as colunas de preço
+/**
+ * Motor de impressão em lote.
+ * Abre UM iframe, gera N etiquetas, carrega JsBarcode UMA vez,
+ * renderiza todos os códigos e dispara UMA janela de impressão.
+ * Cada etiqueta vira uma "página" — a impressora avança uma por vez.
+ *
+ * @param {Array<object>} produtos
+ */
+
+// ═══════════════════════════════════════════════════════════════
+//  IMPRESSÃO DE ETIQUETAS — Sistema completo
+//  - Texto 100% preto (térmica não imprime cinza)
+//  - Suporta 4 larguras: 48 / 58 / 72 / 80 mm
+//  - Impressão em massa com 1 clique
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Mapa de dimensões por largura de bobina.
+ * Escala proporcionalmente paddings, fontes e código de barras.
+ */
+const _LABEL_SIZES = {
+  48: { total: 48, inner: 44, pad: 1.5, scale: 1.00, barcodeH: 32, thumb: 10 },
+  58: { total: 58, inner: 54, pad: 2.0, scale: 1.15, barcodeH: 38, thumb: 12 },
+  72: { total: 72, inner: 68, pad: 2.5, scale: 1.40, barcodeH: 46, thumb: 14 },
+  80: { total: 80, inner: 76, pad: 3.0, scale: 1.55, barcodeH: 52, thumb: 16 },
+};
+
+const _LABEL_SIZE_STORAGE_KEY = "admin_label_width_mm";
+const _LABEL_SIZE_DEFAULT = 48;
+
+/**
+ * Retorna as dimensões ativas.
+ */
+function _getLabelSize() {
+  const saved = parseInt(
+    localStorage.getItem(_LABEL_SIZE_STORAGE_KEY) || String(_LABEL_SIZE_DEFAULT),
+    10,
+  );
+  return _LABEL_SIZES[saved] || _LABEL_SIZES[_LABEL_SIZE_DEFAULT];
+}
+
+/**
+ * Persiste a largura escolhida pelo operador.
+ */
+function _setLabelSize(mm) {
+  const n = parseInt(mm, 10);
+  if (!_LABEL_SIZES[n]) return;
+  localStorage.setItem(_LABEL_SIZE_STORAGE_KEY, String(n));
+}
+
+/**
+ * Gera o HTML de UMA etiqueta — texto preto puro,
+ * suporta 3 modos: tiers (varejo/atacado), preço único, ou sem preço.
+ */
+function _gerarHtmlEtiqueta(produto, index) {
+  const codigo = produto.codigo_barras || "";
+  const nome = produto.nome || "";
+  const imgUrl = produto.imagem_url || "";
+  const cfg = vfBuscarConfigFaixa(produto);
+
   const tiers = [];
   if (cfg && cfg.unitario) {
     tiers.push({ label: "VAREJO", sub: "1 un", preco: cfg.unitario });
-    if (cfg.faixa1_preco && cfg.faixa1_min)
-      tiers.push({ label: `${cfg.faixa1_min}+ un`, sub: "Desconto", preco: cfg.faixa1_preco });
-    if (cfg.faixa2_preco && cfg.faixa2_min)
-      tiers.push({ label: `ATAC. ${cfg.faixa2_min}+`, sub: "Atacado", preco: cfg.faixa2_preco });
+    if (cfg.faixa1_preco && cfg.faixa1_min) {
+      tiers.push({
+        label: `${cfg.faixa1_min}+ un`,
+        sub: "Desconto",
+        preco: cfg.faixa1_preco,
+      });
+    }
+    if (cfg.faixa2_preco && cfg.faixa2_min) {
+      tiers.push({
+        label: `ATAC. ${cfg.faixa2_min}+`,
+        sub: "Atacado",
+        preco: cfg.faixa2_preco,
+      });
+    }
   }
 
-  // ── Caso 1: com faixas → 3 colunas
-  // ── Caso 2: sem faixas → preço único grande (fallback)
-  const colunasHtml = tiers.length > 0
-    ? `
+  let colunasHtml;
+  if (tiers.length > 0) {
+    colunasHtml = `
       <div class="tiers" style="grid-template-columns:repeat(${tiers.length},1fr)">
-        ${tiers.map((t, i) => `
+        ${tiers
+          .map(
+            (t, i) => `
           <div class="tier ${i === 0 ? "tier-destaque" : ""}">
             <div class="tier-label">${t.label}</div>
             <div class="tier-sub">${t.sub}</div>
             <div class="tier-preco">${t.preco.toLocaleString("es-PY")}</div>
-          </div>`).join("")}
-      </div>`
-    : `
+          </div>`,
+          )
+          .join("")}
+      </div>`;
+  } else {
+    const precoNum = Number(produto.preco) || 0;
+    colunasHtml = `
       <div class="preco-unico">
-        <div class="preco-unico-val">${String(preco).replace(/^Gs\s*/i, "")}</div>
+        <div class="preco-unico-val">${precoNum.toLocaleString("es-PY")}</div>
         <div class="preco-unico-lbl">Gs / unidade</div>
       </div>`;
+  }
 
-  // ── Monta o iframe ────────────────────────────────────────
+  const svgId = `barcode-${index || 0}`;
+  const imgTag = imgUrl
+    ? `<img class="thumb" src="${imgUrl}" onerror="this.style.display='none'">`
+    : "";
+
+  return `
+    <div class="etiqueta-item">
+      <div class="etiqueta">
+        <div class="nome">${nome}</div>
+        ${colunasHtml}
+        <div class="rodape">
+          ${imgTag}
+          <svg id="${svgId}" class="barcode"></svg>
+        </div>
+      </div>
+    </div>`;
+}
+
+/**
+ * Motor de impressão em lote.
+ * Adapta o CSS à largura configurada e imprime N etiquetas em UMA janela.
+ */
+function _imprimirLote(produtos) {
+  if (!Array.isArray(produtos) || !produtos.length) {
+    alert("Nenhum produto para imprimir.");
+    return;
+  }
+
+  const size = _getLabelSize();
+  const { total, inner, pad, scale, barcodeH, thumb } = size;
+
+  const validos = produtos.filter(
+    (p) => p && p.codigo_barras && String(p.codigo_barras).trim(),
+  );
+  const semCodigo = produtos.length - validos.length;
+
+  if (!validos.length) {
+    alert(
+      "Nenhum dos produtos selecionados possui código de barras cadastrado.\n\n" +
+        "Cadastre um código antes de imprimir a etiqueta.",
+    );
+    return;
+  }
+
+  if (semCodigo > 0) {
+    const ok = confirm(
+      `${semCodigo} produto(s) não possuem código de barras e serão ignorados.\n\n` +
+        `Imprimir as ${validos.length} etiqueta(s) restantes?`,
+    );
+    if (!ok) return;
+  }
+
   const iframe = document.createElement("iframe");
-  iframe.style.cssText = "position:fixed;opacity:0;width:0;height:0;border:none;";
+  iframe.style.cssText =
+    "position:fixed;opacity:0;width:0;height:0;border:none;";
   document.body.appendChild(iframe);
 
   const doc = iframe.contentWindow.document;
-  doc.body.innerHTML = `
-    <div class="etiqueta">
-      <div class="nome">${nomeProduto}</div>
-      ${colunasHtml}
-      <div class="rodape">
-        ${imgUrl ? `<img class="thumb" src="${imgUrl}" onerror="this.style.display='none'">` : ""}
-        <svg id="barcode" class="barcode"></svg>
-      </div>
-    </div>
-  `;
+
+  doc.body.innerHTML = validos
+    .map((p, i) => _gerarHtmlEtiqueta(p, i))
+    .join("");
 
   const style = doc.createElement("style");
   style.textContent = `
-    @page { size: 58mm auto; margin: 2mm; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: 'Arial', sans-serif;
-      background: #fff; color: #000;
-      padding: 2mm;
+    @page { size: ${total}mm auto; margin: 1mm; }
+    * {
+      box-sizing: border-box; margin: 0; padding: 0;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
     }
-    .etiqueta {
-      width: 54mm;
-      border: 1.5px dashed #000;
-      padding: 2mm;
-    }
+    body { font-family: 'Arial', sans-serif; background: #fff; color: #000; padding: 0; }
+    .etiqueta-item { page-break-after: always; break-after: page; padding: 0; margin: 0; }
+    .etiqueta-item:last-child { page-break-after: auto; break-after: auto; }
+    .etiqueta { width: ${inner}mm; background: #fff; color: #000; padding: ${pad}mm; margin: 0 auto; }
     .nome {
-      font-size: 11px; font-weight: 800;
-      text-transform: uppercase;
-      text-align: center;
-      padding-bottom: 2mm;
+      font-size: ${11 * scale}px; font-weight: 900; color: #000;
+      text-transform: uppercase; text-align: center;
+      padding-bottom: ${1.5 * scale}mm;
       border-bottom: 1px solid #000;
-      margin-bottom: 2mm;
-      line-height: 1.2;
-      word-break: break-word;
+      margin-bottom: ${1.5 * scale}mm;
+      line-height: 1.15; word-break: break-word;
     }
-    /* ── Tiers (3 colunas) ─────────────────── */
-    .tiers {
-      display: grid;
-      gap: 1mm;
-      margin-bottom: 2mm;
-    }
+    .tiers { display: grid; gap: ${1 * scale}mm; margin-bottom: ${1.5 * scale}mm; }
     .tier {
-      border: 1.2px solid #000;
-      border-radius: 2mm;
-      padding: 1.5mm 1mm;
-      text-align: center;
-      background: #f5f5f5;
+      border: 1.2px solid #000; border-radius: ${1.5 * scale}mm;
+      padding: ${1.5 * scale}mm ${0.8 * scale}mm;
+      text-align: center; background: #fff; color: #000;
     }
-    .tier-destaque {
-      background: #000;
-      color: #fff;
-    }
-    .tier-destaque .tier-sub { color: rgba(255,255,255,0.7); }
+    .tier-destaque { border-width: 2px; background: #fff; color: #000; }
     .tier-label {
-      font-size: 8px; font-weight: 900;
-      letter-spacing: 0.3px;
-      text-transform: uppercase;
-      line-height: 1.1;
+      font-size: ${8 * scale}px; font-weight: 900;
+      letter-spacing: 0.2px; text-transform: uppercase;
+      color: #000; line-height: 1.1;
     }
-    .tier-sub {
-      font-size: 6px; color: #666;
-      margin-top: 0.5mm; line-height: 1;
-    }
+    .tier-sub { font-size: ${6 * scale}px; color: #000; margin-top: ${0.3 * scale}mm; line-height: 1; }
     .tier-preco {
-      font-size: 14px; font-weight: 900;
-      margin-top: 1mm; line-height: 1;
-      letter-spacing: -0.3px;
+      font-size: ${13 * scale}px; font-weight: 900;
+      margin-top: ${1 * scale}mm; color: #000;
+      line-height: 1; letter-spacing: -0.2px;
     }
-    /* ── Preço único (sem faixas) ──────────── */
-    .preco-unico {
-      text-align: center;
-      padding: 2mm 0 3mm;
-    }
+    .preco-unico { text-align: center; padding: ${2 * scale}mm 0 ${3 * scale}mm; color: #000; }
     .preco-unico-val {
-      font-size: 26px; font-weight: 900;
-      letter-spacing: -0.5px;
-      line-height: 1;
+      font-size: ${26 * scale}px; font-weight: 900;
+      color: #000; line-height: 1; letter-spacing: -0.5px;
     }
-    .preco-unico-lbl {
-      font-size: 8px; color: #666;
-      margin-top: 1mm;
-    }
-    /* ── Rodapé: thumb + barcode ───────────── */
+    .preco-unico-lbl { font-size: ${8 * scale}px; color: #000; margin-top: ${1 * scale}mm; }
     .rodape {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 1.5mm;
-      padding-top: 2mm;
-      border-top: 1px solid #000;
+      display: flex; align-items: center; justify-content: center;
+      gap: ${1.5 * scale}mm; padding-top: ${1.5 * scale}mm;
+      border-top: 1px solid #000; color: #000;
     }
     .thumb {
-      width: 10mm; height: 10mm;
-      object-fit: cover;
-      border-radius: 1mm;
-      flex-shrink: 0;
+      width: ${thumb}mm; height: ${thumb}mm;
+      object-fit: cover; border-radius: 1mm; flex-shrink: 0;
     }
-    .barcode {
-      flex: 1;
-      max-width: 40mm;
-      height: auto;
-    }
+    .barcode { flex: 1; max-width: ${inner - thumb - 4}mm; height: auto; }
   `;
   doc.head.appendChild(style);
 
   const script = doc.createElement("script");
-  script.src = "https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js";
+  script.src =
+    "https://cdn.jsdelivr.net/npm/jsbarcode@3.11.5/dist/JsBarcode.all.min.js";
+
   script.onload = function () {
     try {
-      if (!codigo) {
-        // Sem código — não desenha nada
-        iframe.contentWindow.focus();
-        setTimeout(() => { iframe.contentWindow.print(); document.body.removeChild(iframe); }, 200);
-        return;
-      }
-      let formato = /^\d{13}$/.test(codigo) ? "EAN13" : "CODE128";
-      try {
-        iframe.contentWindow.JsBarcode("#barcode", codigo, {
-          format: formato, width: 1.4, height: 28,
-          displayValue: true, fontSize: 8, margin: 0,
-        });
-      } catch (_) {
-        iframe.contentWindow.JsBarcode("#barcode", codigo, {
-          format: "CODE128", width: 1.4, height: 28,
-          displayValue: true, fontSize: 8, margin: 0,
-        });
-      }
+      validos.forEach((p, i) => {
+        const svgId = `barcode-${i}`;
+        const code = String(p.codigo_barras).trim();
+        const isEan13 = /^\d{13}$/.test(code);
+        const opts = {
+          width: 1.5,
+          height: barcodeH,
+          displayValue: true,
+          fontSize: 10 * scale,
+          margin: 0,
+          textMargin: 1,
+          fontOptions: "bold",
+          lineColor: "#000000",
+          background: "#ffffff",
+        };
+
+        try {
+          iframe.contentWindow.JsBarcode(
+            `#${svgId}`,
+            code,
+            Object.assign({ format: isEan13 ? "EAN13" : "CODE128" }, opts),
+          );
+        } catch (_) {
+          iframe.contentWindow.JsBarcode(
+            `#${svgId}`,
+            code,
+            Object.assign({ format: "CODE128" }, opts),
+          );
+        }
+      });
+
       iframe.contentWindow.focus();
       setTimeout(() => {
         iframe.contentWindow.print();
-        document.body.removeChild(iframe);
-      }, 300);
+        setTimeout(() => {
+          if (document.body.contains(iframe)) document.body.removeChild(iframe);
+        }, 3000);
+      }, 500);
     } catch (err) {
-      console.error("Erro barcode:", err);
-      document.body.removeChild(iframe);
+      console.error("[_imprimirLote] Erro JsBarcode:", err);
+      if (document.body.contains(iframe)) document.body.removeChild(iframe);
+      alert("Erro ao gerar códigos de barras.");
     }
   };
-  script.onerror = () => document.body.removeChild(iframe);
+
+  script.onerror = function () {
+    if (document.body.contains(iframe)) document.body.removeChild(iframe);
+    alert("Erro ao carregar biblioteca de código de barras.");
+  };
+
   doc.head.appendChild(script);
+}
+
+/**
+ * Imprime etiqueta de UM produto (chamado pelo botão dentro do card).
+ * Mantém assinatura original para não quebrar o onclick existente.
+ */
+function imprimirCodigoBarras(codigo, nomeProduto, preco, produtoId) {
+  let produto = null;
+  if (produtoId && typeof _produtosMap !== "undefined") {
+    produto = _produtosMap[produtoId];
+  }
+  if (!produto) {
+    produto = {
+      nome: nomeProduto || "Produto",
+      codigo_barras: codigo || "",
+      preco: parseInt(String(preco).replace(/\D/g, ""), 10) || 0,
+      imagem_url: "",
+      montagem_config: null,
+    };
+  }
+  _imprimirLote([produto]);
+}
+
+/**
+ * Imprime etiquetas de TODOS os produtos marcados na lista.
+ * Chamada pelo botão "Imprimir Etiquetas" da barra de ações em massa.
+ */
+function imprimirEtiquetasEmMassa() {
+  const ids = _ptGetIdsSelecionados();
+  if (!ids.length) {
+    alert("Selecione ao menos 1 produto para imprimir etiquetas.");
+    return;
+  }
+
+  const produtos = ids
+    .map((id) =>
+      typeof _produtosMap !== "undefined" ? _produtosMap[id] : null,
+    )
+    .filter(Boolean);
+
+  if (!produtos.length) {
+    alert("Produtos selecionados não foram encontrados no cache.");
+    return;
+  }
+
+  _imprimirLote(produtos);
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -17277,3 +18055,86 @@ function _pdvRealocarBuscaParaTopo() {
     buscaWrap.appendChild(f2Btn);
   }
 }
+
+/**
+ * Injeta o badge numérico dentro do item "PDV" do menu lateral.
+ * Só roda uma vez; chamadas subsequentes não duplicam.
+ * O badge fica oculto por padrão e é ativado por
+ * _atualizarBadgePedidosPendentes() quando houver pedidos pendentes.
+ */
+function _injetarBadgeNoMenuPDV() {
+  const menuPDV = document.getElementById("menu-pdv");
+  if (!menuPDV) return;
+  if (document.getElementById("menu-pdv-badge")) return; // já injetado
+
+  const badge = document.createElement("span");
+  badge.id = "menu-pdv-badge";
+  badge.textContent = "0";
+  badge.style.display = "none";
+  menuPDV.appendChild(badge);
+}
+
+/**
+ * Consulta o banco e atualiza, de uma só vez:
+ *   - o card de alerta no topo da aba PDV
+ *   - o badge numérico no ícone do menu lateral
+ *
+ * Chamada em 3 momentos:
+ *   1. Ao abrir a aba PDV (carregarPDV)
+ *   2. Quando chega INSERT de pedido (iniciarRealtime)
+ *   3. A cada 60s pelo setInterval global (backup anti-falha de Realtime)
+ *
+ * @returns {Promise<number>} quantidade de pedidos pendentes
+ */
+async function _atualizarBadgePedidosPendentes() {
+  // Conta apenas pedidos com status = 'pendente' (aguardando aceitação)
+  const { count, error } = await supa
+    .from("pedidos")
+    .select("*", { count: "exact", head: true })
+    .eq("status", "pendente");
+
+  if (error) {
+    console.warn("[_atualizarBadgePedidosPendentes]", error.message);
+    return 0;
+  }
+
+  const n = count || 0;
+
+  // ── 1. Badge do menu lateral ──────────────────────────────────
+  const badgeMenu = document.getElementById("menu-pdv-badge");
+  if (badgeMenu) {
+    if (n > 0) {
+      badgeMenu.textContent = n > 99 ? "99+" : String(n);
+      badgeMenu.style.display = "inline-flex";
+    } else {
+      badgeMenu.style.display = "none";
+    }
+  }
+
+  // ── 2. Card de alerta dentro da aba PDV ───────────────────────
+  const card = document.getElementById("pdv-alerta-pedidos");
+  const titulo = document.getElementById("pdv-alerta-titulo");
+  const sub = document.getElementById("pdv-alerta-sub");
+
+  if (card) {
+    if (n > 0) {
+      // Atualiza textos com o número em destaque
+      if (titulo) {
+        titulo.innerHTML =
+          `<span id="pdv-alerta-count">${n}</span>` +
+          (n === 1
+            ? "pedido aguardando aceitação"
+            : "pedidos aguardando aceitação");
+      }
+      if (sub) {
+        sub.innerHTML =
+          "Clique para revisar e confirmar os pedidos do app.";
+      }
+      card.style.display = "flex";
+    } else {
+      card.style.display = "none";
+    }
+  }
+
+  return n;
+};
