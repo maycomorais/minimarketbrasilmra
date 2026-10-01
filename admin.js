@@ -675,91 +675,106 @@ async function salvarFeatures() {
 }
 
 // Renderiza painel de features (adminMaster)
+//
+// ─────────────────────────────────────────────────────────────
+//  ARQUITETURA (fix do conflito entre abas):
+//
+//  O painel completo é renderizado APENAS em
+//  #painel-features-master (aba Admin Master).
+//
+//  O card #card-adminmaster-cfg (dentro de Configurações) NÃO
+//  duplica os checkboxes — vira um atalho visual que redireciona
+//  para a aba Admin Master.
+//
+//  Por quê:
+//  Antes, os mesmos atributos data-feat-* eram renderizados em
+//  DOIS lugares (#painel-features E #painel-features-master).
+//  salvarFeatures() usava document.querySelectorAll() global, que
+//  capturava AMBAS as cópias — o valor final dependia da ordem do
+//  DOM (o último sobrescrevia), silenciosamente descartando as
+//  edições feitas no outro painel.
+// ─────────────────────────────────────────────────────────────
 async function renderPainelFeatures() {
-  const targets = ["painel-features", "painel-features-master"]
-    .map((id) => document.getElementById(id))
-    .filter(Boolean);
-  if (!targets.length) return;
+  const master   = document.getElementById("painel-features-master");
+  const shortcut = document.getElementById("painel-features");
+  if (!master && !shortcut) return;
+
   await _carregarFeaturesGlobais();
-  const f = FEATURES_ATIVAS || {};
-  const tabs = f.tabs || {};
-  const tipos = f.tipos_produto || {};
-  const funcs = f.funcionalidades || {};
+  const f      = FEATURES_ATIVAS || {};
+  const tabs   = f.tabs            || {};
+  const tipos  = f.tipos_produto   || {};
+  const funcs  = f.funcionalidades || {};
+  const pags   = f.pagamentos      || {};
 
   const chkTabs = [
-    ["pedidos", "Pedidos"],
-    ["cozinha", "Cozinha/KDS"],
-    ["pdv", "PDV Balcão"],
-    ["financeiro", "Financeiro"],
-    ["inventario", "Inventário"],
-    ["equipe", "Equipe"],
-    ["configuracoes", "Configurações"],
-    ["dashboard", "Dashboard"],
-    ["turnos", "Painel Turnos/TV"],
+    ["pedidos",         "Pedidos"],
+    ["cozinha",         "Cozinha/KDS"],
+    ["pdv",             "PDV Balcão"],
+    ["financeiro",      "Financeiro"],
+    ["inventario",      "Inventário"],
+    ["equipe",          "Equipe"],
+    ["configuracoes",   "Configurações"],
+    ["dashboard",       "Dashboard"],
+    ["turnos",          "Painel Turnos/TV"],
+    ["estatisticas",    "Estatísticas"],
+    ["ficha-tecnica",   "Ficha Técnica"],
+    ["crm",             "CRM Clientes"],
+    ["mensalistas",     "Mensalistas"],
+    ["filiais",         "Filiais"],
   ]
     .map(
-      ([
-        k,
-        l,
-      ]) => `<label style="display:flex;align-items:center;gap:8px;padding:6px;background:#f9f9f9;border-radius:6px">
+      ([k, l]) => `<label style="display:flex;align-items:center;gap:8px;padding:6px;background:#f9f9f9;border-radius:6px">
     <input type="checkbox" data-feat-tab="${k}" ${tabs[k] !== false ? "checked" : ""} style="width:18px;height:18px">
     <span>${l}</span></label>`,
     )
     .join("");
 
   const chkTipos = [
-    ["padrao", "Simples"],
-    ["bebida", "Bebida"],
-    ["lanche", "Lanche"],
-    ["pizza", "Pizza"],
-    ["acai", "Açaí"],
-    ["shake", "Shake"],
-    ["suco", "Suco"],
-    ["sorvete", "Sorvete"],
-    ["montavel", "Montável"],
-    ["combo", "Combo"],
-    ["variacoes", "Variações"],
-    ["kg", "⚖️ Venda Kg"],
+    ["padrao",     "Simples"],
+    ["bebida",     "Bebida"],
+    ["lanche",     "Lanche"],
+    ["pizza",      "Pizza"],
+    ["acai",       "Açaí"],
+    ["shake",      "Shake"],
+    ["suco",       "Suco"],
+    ["sorvete",    "Sorvete"],
+    ["montavel",   "Montável"],
+    ["combo",      "Combo"],
+    ["variacoes",  "Variações"],
+    ["kg",         "⚖️ Venda Kg"],
   ]
     .map(
-      ([
-        k,
-        l,
-      ]) => `<label style="display:flex;align-items:center;gap:8px;padding:6px;background:#f9f9f9;border-radius:6px">
+      ([k, l]) => `<label style="display:flex;align-items:center;gap:8px;padding:6px;background:#f9f9f9;border-radius:6px">
     <input type="checkbox" data-feat-tipo="${k}" ${tipos[k] !== false ? "checked" : ""} style="width:18px;height:18px">
     <span>${l}</span></label>`,
     )
     .join("");
 
   const chkFuncs = [
-    ["delivery", "Delivery"],
-    ["retirada", "Retirada"],
-    ["local", "Comer no Local"],
-    ["balcao", "Balcão/PDV"],
-    ["cupons", "Cupons"],
-    ["factura", "Factura"],
-    ["multipagamento", "Multipagamento"],
-    ["agendamento", "Agendamento"],
+    ["delivery",         "Delivery"],
+    ["retirada",         "Retirada"],
+    ["local",            "Comer no Local"],
+    ["balcao",           "Balcão/PDV"],
+    ["cupons",           "Cupons"],
+    ["factura",          "Factura"],
+    ["multipagamento",   "Multipagamento"],
+    ["agendamento",      "Agendamento"],
   ]
     .map(
-      ([
-        k,
-        l,
-      ]) => `<label style="display:flex;align-items:center;gap:8px;padding:6px;background:#f9f9f9;border-radius:6px">
+      ([k, l]) => `<label style="display:flex;align-items:center;gap:8px;padding:6px;background:#f9f9f9;border-radius:6px">
     <input type="checkbox" data-feat-func="${k}" ${funcs[k] !== false ? "checked" : ""} style="width:18px;height:18px">
     <span>${l}</span></label>`,
     )
     .join("");
 
-  const pags = f.pagamentos || {};
   const chkPags = [
-    ["Efetivo", "💵 Efectivo/Dinheiro"],
-    ["Cartao", "💳 Tarjeta PY"],
-    ["CartaoBR", "💳🇧🇷 Cartão Brasileiro (R$)"],
-    ["Pix", "🟢 Pix (BR)"],
-    ["Transferencia", "🏦 Alias/Transferência PY"],
-    ["QrPy", "📱 QR Paraguay"],
-    ["Multipagamento", "🔀 Dividir Pagamento"],
+    ["Efetivo",         "💵 Efectivo/Dinheiro"],
+    ["Cartao",          "💳 Tarjeta PY"],
+    ["CartaoBR",        "💳🇧🇷 Cartão Brasileiro (R$)"],
+    ["Pix",             "🟢 Pix (BR)"],
+    ["Transferencia",   "🏦 Alias/Transferência PY"],
+    ["QrPy",            "📱 QR Paraguay"],
+    ["Multipagamento",  "🔀 Dividir Pagamento"],
   ]
     .map(
       ([k, l]) =>
@@ -790,9 +805,30 @@ async function renderPainelFeatures() {
       </div>
       <button class="btn btn-primary" onclick="salvarFeatures()"><i class="fas fa-save"></i> Salvar Features</button>
     </div>`;
-  targets.forEach((el) => {
-    el.innerHTML = html;
-  });
+
+  // ── Painel autoritativo: aba Admin Master ──
+  if (master) master.innerHTML = html;
+
+  // ── Configurações: vira atalho (não duplica checkboxes) ──
+  if (shortcut) {
+    shortcut.innerHTML = `
+      <div style="background:#fff5f5;border:1.5px dashed #fca5a5;border-radius:10px;padding:22px 20px;text-align:center">
+        <div style="font-size:1.8rem;margin-bottom:8px">🛡️</div>
+        <div style="font-weight:700;font-size:0.95rem;color:#991b1b;margin-bottom:8px">
+          Controle de Features
+        </div>
+        <div style="font-size:0.83rem;color:#7f1d1d;line-height:1.55;margin-bottom:16px">
+          O gerenciamento de features agora é feito em um lugar único —<br>
+          aba <b>Admin Master</b> — para evitar conflito de estado<br>
+          entre painéis duplicados.
+        </div>
+        <button onclick="showTab('adminmaster', { currentTarget: document.getElementById('menu-adminmaster') })"
+          class="btn btn-danger"
+          style="font-size:0.86rem;padding:10px 20px;background:#e74c3c;border-color:#e74c3c;font-weight:700">
+          <i class="fas fa-arrow-right"></i> Ir para Admin Master
+        </button>
+      </div>`;
+  }
 }
 
 function iniciarRealtime() {
@@ -2510,6 +2546,9 @@ if (badgeCaixa) {
   // ── Relatório Detalhado de Vendas: popula com os pedidos já carregados ──
   // Não faz nova query ao banco — reutiliza `peds` (já filtrados por data e forma de pagamento).
   _finRelPopular(peds);
+
+  // ── Histórico de Boletins de Fechamento (card novo) ──
+  carregarHistoricoFechamentos();
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -3675,8 +3714,40 @@ Faturamento Total: ${fmt(r.faturamento)}
 Sessão encerrada com sucesso.`
     );
 
+    // ── 7.5. Oferta de impressão imediata do boletim ──────────────
+    // Reutiliza os mesmos valores recém-calculados em `r` — sem
+    // nova query, garantindo que o boletim reflita exatamente o
+    // fechamento que acabou de acontecer.
+    if (confirm("🖨️ Deseja imprimir o boletim de fechamento agora?")) {
+      _abrirJanelaImpressaoFechamento({
+        sessao_id:           sessaoId,
+        usuario_email:       emailAtual,
+        usuario_nome:        nomeAtual,
+        aberto_em:           abertoEm,
+        fechado_em:          fechadoEm,
+        valor_abertura:      valorAbertura,
+        faturamento:         r.faturamento,
+        qtd_pedidos:         r.qtd_pedidos,
+        custo_entregas:      r.custo_entregas,
+        total_despesas:      r.total_despesas,
+        total_sangrias:      r.total_sangrias,
+        total_suprimentos:   r.total_suprimentos,
+        lucro_operacional:   r.lucro_operacional,
+        dinheiro_gaveta:     r.dinheiro_gaveta,
+        total_efetivo:       r.total_efetivo,
+        total_pix:           r.total_pix,
+        total_cartao:        r.total_cartao,
+        total_cartao_br:     r.total_cartao_br,
+        total_transferencia: r.total_transferencia,
+        total_qr_py:         r.total_qr_py,
+        total_multi_outros:  r.total_multi_outros,
+      });
+    }
+
     // ── 8. Limpa estado local e atualiza UI ───────────────────────
     _sessaoCaixaAtiva = null;
+
+    
 
     [
       "card-faturamento",
@@ -3738,6 +3809,222 @@ Sessão encerrada com sucesso.`
       _btnFechar.style.opacity = "1";
     }
   }
+}
+
+// ══════════════════════════════════════════════════════════════
+// HISTÓRICO DE BOLETINS DE FECHAMENTO DE CAIXA
+// ══════════════════════════════════════════════════════════════
+
+async function carregarHistoricoFechamentos() {
+  const tbody    = document.getElementById("hist-fech-tbody");
+  const contador = document.getElementById("hist-fech-contador");
+  if (!tbody) return;
+
+  tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#aaa;padding:20px"><i class="fas fa-spinner fa-spin"></i> Carregando...</td></tr>';
+
+  const { data, error } = await supa
+    .from("caixa_fechamentos")
+    .select("*")
+    .order("fechado_em", { ascending: false })
+    .limit(100);
+
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:#e74c3c;padding:20px;font-size:0.85rem">
+      Erro: ${error.message}<br>
+      <small style="color:#888">Verifique se a tabela <code>caixa_fechamentos</code> existe no Supabase.</small>
+    </td></tr>`;
+    if (contador) contador.style.display = "none";
+    return;
+  }
+
+  if (contador) {
+    const n = (data || []).length;
+    contador.textContent = `${n} boletim${n !== 1 ? "s" : ""}`;
+    contador.style.display = n ? "inline" : "none";
+  }
+
+  if (!data || !data.length) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#bbb;padding:24px;font-size:0.85rem">Nenhum fechamento registrado ainda.</td></tr>';
+    return;
+  }
+
+  const fmt = (n) => "Gs " + Math.round(Number(n) || 0).toLocaleString("es-PY");
+  const fmtDt = (iso) => {
+    if (!iso) return "—";
+    return new Date(iso).toLocaleString("pt-BR", {
+      timeZone: "America/Asuncion",
+      day: "2-digit", month: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+  };
+
+  tbody.innerHTML = data.map((f) => `
+    <tr>
+      <td style="font-weight:700;color:#1a1a2e">#${f.sessao_id}</td>
+      <td style="font-size:0.78rem;color:#666;white-space:nowrap">
+        ${fmtDt(f.aberto_em)}<br>
+        <span style="color:#aaa">→ ${fmtDt(f.fechado_em)}</span>
+      </td>
+      <td style="font-size:0.82rem">
+        ${f.usuario_nome || "—"}<br>
+        <small style="color:#999">${f.usuario_email || ""}</small>
+      </td>
+      <td style="text-align:right;font-weight:600">${fmt(f.faturamento)}</td>
+      <td style="text-align:right;font-weight:700;color:${(f.lucro_operacional || 0) >= 0 ? "#16a34a" : "#dc2626"}">
+        ${fmt(f.lucro_operacional)}
+      </td>
+      <td style="text-align:right;font-weight:600">${fmt(f.dinheiro_gaveta)}</td>
+      <td style="text-align:center;white-space:nowrap">
+        <button onclick="imprimirFechamento(${f.id})"
+          style="background:#1a7a2e;color:#fff;border:none;border-radius:6px;padding:5px 12px;cursor:pointer;font-size:0.78rem;font-weight:700;display:inline-flex;align-items:center;gap:4px">
+          <i class="fas fa-print"></i> Imprimir
+        </button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+async function imprimirFechamento(id) {
+  const { data, error } = await supa
+    .from("caixa_fechamentos")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (error || !data) {
+    alert("Erro ao buscar boletim: " + (error?.message || "não encontrado"));
+    return;
+  }
+  _abrirJanelaImpressaoFechamento(data);
+}
+
+function _abrirJanelaImpressaoFechamento(f) {
+  const win = window.open("", "_blank", "width=520,height=800");
+  if (!win) {
+    alert("Permita pop-ups neste site para imprimir o boletim.");
+    return;
+  }
+  win.document.open();
+  win.document.write(_gerarHtmlFechamentoTermico(f));
+  win.document.close();
+  setTimeout(() => {
+    try { win.focus(); win.print(); } catch (_) {}
+  }, 700);
+}
+
+function _gerarHtmlFechamentoTermico(f) {
+  const fmtGs = (n) => "Gs " + Math.round(Number(n) || 0).toLocaleString("es-PY");
+  const fmtDt = (iso) => {
+    if (!iso) return "—";
+    return new Date(iso).toLocaleString("pt-BR", {
+      timeZone: "America/Asuncion",
+      day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    });
+  };
+  const nomeLoja = (typeof NOME_RESTAURANTE !== "undefined" && NOME_RESTAURANTE) ? NOME_RESTAURANTE : "LOJA";
+  const impressoEm = new Date().toLocaleString("pt-BR", { timeZone: "America/Asuncion" });
+
+  const linha = (label, valor, bold) =>
+    `<div class="linha"${bold ? ' style="font-weight:700"' : ""}><span>${label}</span><span>${valor}</span></div>`;
+
+  return `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Boletim de Fechamento — Sessão #${f.sessao_id}</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: Arial, sans-serif; font-size:12px; color:#000; background:#d0d0d0; padding:16px; }
+  .ticket { background:#fff; max-width:300px; margin:0 auto; padding:10px; box-shadow:0 4px 12px rgba(0,0,0,0.2); color:#000; }
+  .topo { text-align:center; margin-bottom:6px; }
+  .topo h2 { font-size:15px; font-weight:900; letter-spacing:0.5px; color:#000; }
+  .topo h3 { font-size:12px; font-weight:700; margin-top:2px; color:#000; }
+  .topo small { font-size:10px; color:#000; }
+  .bloco { font-size:12px; line-height:1.5; color:#000; }
+  .bloco-title { font-weight:800; font-size:11px; letter-spacing:0.5px; padding:3px 0; color:#000; text-transform:uppercase; }
+  .linha { display:flex; justify-content:space-between; padding:2px 0; color:#000; }
+  .sep { border-top:1px dashed #000; margin:6px 0; }
+  .sep-dup { border-top:2px solid #000; margin:6px 0; }
+  .assinatura { margin-top:20px; text-align:center; font-size:11px; color:#000; }
+  .assinatura .linha-ass { border-top:1px solid #000; width:80%; margin:24px auto 4px; }
+  .rodape { text-align:center; font-size:10px; color:#000; margin-top:8px; }
+  .btn-print { display:block; width:100%; max-width:300px; margin:16px auto 0; padding:14px; background:#1a7a2e; color:#fff; border:none; font-size:15px; font-weight:700; cursor:pointer; border-radius:8px; font-family:Arial, sans-serif; }
+  @media print {
+    body { background:none; padding:0; font-size:12px; }
+    .btn-print { display:none; }
+    .ticket { box-shadow:none; max-width:100%; width:100%; padding:2mm; }
+    @page { margin:2mm; size:80mm auto; }
+    * { color:#000 !important; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  }
+</style>
+</head>
+<body>
+  <div class="ticket">
+    <div class="topo">
+      <h2>${nomeLoja.toUpperCase()}</h2>
+      <h3>BOLETIM DE FECHAMENTO</h3>
+      <small>Sessão #${f.sessao_id}</small>
+    </div>
+
+    <div class="sep-dup"></div>
+
+    <div class="bloco">
+      <div class="linha"><span>Operador:</span><span>${f.usuario_nome || "—"}</span></div>
+      <div class="linha"><span>E-mail:</span><span style="font-size:10px">${f.usuario_email || "—"}</span></div>
+      <div class="linha"><span>Aberto:</span><span>${fmtDt(f.aberto_em)}</span></div>
+      <div class="linha"><span>Fechado:</span><span>${fmtDt(f.fechado_em)}</span></div>
+    </div>
+
+    <div class="sep"></div>
+    <div class="bloco-title">Resumo de Vendas</div>
+    <div class="bloco">
+      ${linha("Faturamento total:", fmtGs(f.faturamento), true)}
+      ${linha("Pedidos:", (f.qtd_pedidos || 0).toString())}
+    </div>
+
+    <div class="sep"></div>
+    <div class="bloco-title">Por Forma de Pagamento</div>
+    <div class="bloco">
+      ${linha("Dinheiro:", fmtGs(f.total_efetivo))}
+      ${linha("Pix:", fmtGs(f.total_pix))}
+      ${linha("Cartão PY:", fmtGs(f.total_cartao))}
+      ${linha("Cartão BR:", fmtGs(f.total_cartao_br))}
+      ${linha("Transferência:", fmtGs(f.total_transferencia))}
+      ${linha("QR Paraguay:", fmtGs(f.total_qr_py))}
+      ${(f.total_multi_outros || 0) > 0 ? linha("Multi/Outros:", fmtGs(f.total_multi_outros)) : ""}
+    </div>
+
+    <div class="sep"></div>
+    <div class="bloco-title">Movimentações de Caixa</div>
+    <div class="bloco">
+      ${linha("Abertura:", fmtGs(f.valor_abertura))}
+      ${linha("Suprimentos:", fmtGs(f.total_suprimentos))}
+      ${linha("Despesas:", "- " + fmtGs(f.total_despesas))}
+      ${linha("Sangrias:", "- " + fmtGs(f.total_sangrias))}
+      ${linha("Custo entregas:", "- " + fmtGs(f.custo_entregas))}
+    </div>
+
+    <div class="sep-dup"></div>
+    <div class="bloco-title">Resultado</div>
+    <div class="bloco" style="font-size:13px">
+      ${linha("Lucro operacional:", fmtGs(f.lucro_operacional), true)}
+      ${linha("Dinheiro na gaveta:", fmtGs(f.dinheiro_gaveta), true)}
+    </div>
+
+    <div class="sep-dup"></div>
+
+    <div class="assinatura">
+      <div class="linha-ass"></div>
+      Assinatura do Operador
+    </div>
+
+    <div class="rodape">Impresso em: ${impressoEm}</div>
+  </div>
+
+  <button class="btn-print" onclick="window.print()">🖨️ IMPRIMIR</button>
+</body>
+</html>`;
 }
 
 // =========================================
@@ -5001,7 +5288,7 @@ async function salvarProduto() {
     const fileInput = document.getElementById("prod-img-file");
     let urlFinal = document.getElementById("prod-img").value;
 
-    // ── Upload para o Cloudinary ──────────────────────────────
+    // ── Upload para o Supabase Storage ────────────────────────
     console.log(
       "[salvarProduto] fileInput.files.length:",
       fileInput.files.length,
@@ -5011,8 +5298,7 @@ async function salvarProduto() {
     if (fileInput.files.length > 0) {
       btn.innerText = "📤 Enviando imagem...";
       try {
-        urlFinal = await uploadImageToSupabase(fileInput.files[0], 'produtos');
-        // Atualiza o campo de URL para refletir o resultado
+        urlFinal = await uploadImageToSupabase(fileInput.files[0], "produtos");
         document.getElementById("prod-img").value = urlFinal;
         document.getElementById("img-preview").src = urlFinal;
         document.getElementById("box-preview").style.display = "block";
@@ -5027,15 +5313,12 @@ async function salvarProduto() {
         return;
       }
     } else if (urlFinal && urlFinal.trim()) {
-      // URL digitada manualmente — usa direto, sem upload
       urlFinal = urlFinal.trim();
     }
 
     btn.innerText = "Salvando...";
 
-    const tipo = document.getElementById("prod-tipo-builder").value || "padrao";
-
-    // Valida campos obrigatórios
+    // ── Validações obrigatórias ───────────────────────────────
     const _nomeVal = document.getElementById("prod-nome").value.trim();
     if (!_nomeVal) {
       alert("⚠️ O nome do produto é obrigatório.");
@@ -5047,9 +5330,13 @@ async function salvarProduto() {
       return;
     }
 
-    // Preço base — usa dataset.valorNumerico (setado pela máscara) para evitar que
-    // parseInt("12.000") retorne 12 ao encontrar o ponto separador de milhar paraguaio
-    const _precoEl = document.getElementById("prod-preco");
+    // ── Preço base ────────────────────────────────────────────
+    // Lê do campo principal. Se vazio e as faixas estão ativas com
+    // unitário preenchido, usa a faixa unitária (evita gravar preco = 0).
+    const _precoEl      = document.getElementById("prod-preco");
+    const _faixaUniEl   = document.getElementById("prod-faixa-unitario");
+    const _faixasAtivas = document.getElementById("prod-tem-faixas")?.checked === true;
+
     let precoBase =
       parseInt(
         _precoEl?.dataset?.valorNumerico ||
@@ -5057,42 +5344,62 @@ async function salvarProduto() {
           "0",
         10,
       ) || 0;
+
+    if (precoBase <= 0 && _faixasAtivas && _faixaUniEl) {
+      precoBase =
+        parseInt(
+          _faixaUniEl.dataset?.valorNumerico ||
+            _faixaUniEl.value ||
+            "0",
+          10,
+        ) || 0;
+    }
+
     if (document.getElementById("prod-venda-kg")?.checked) {
       const pkgVal =
         parseFloat(document.getElementById("prod-preco-kg")?.value) || 0;
       if (pkgVal > 0) precoBase = pkgVal;
     }
 
+    // ── Promoção ──────────────────────────────────────────────
     let precoOriginal = null;
     let emPromocao = false;
 
     if (document.getElementById("prod-promo-ativo")?.checked) {
-      const tipo = document.getElementById("prod-promo-tipo")?.value;
+      const tipoPromo = document.getElementById("prod-promo-tipo")?.value;
       const valor =
         parseFloat(document.getElementById("prod-promo-valor")?.value) || 0;
 
       if (valor > 0) {
         emPromocao = true;
-        precoOriginal = precoBase; // guarda o preço original
+        precoOriginal = precoBase;
 
-        if (tipo === "percent") {
+        if (tipoPromo === "percent") {
           if (valor >= 100) {
             alert("⚠️ Desconto percentual inválido.");
             return;
           }
-          precoBase = Math.round(precoBase * (1 - valor / 100)); // calcula o promocional
+          precoBase = Math.round(precoBase * (1 - valor / 100));
         } else {
-          // fixo
-          precoBase = Math.max(0, precoBase - valor); // subtrai o desconto fixo
+          precoBase = Math.max(0, precoBase - valor);
         }
       }
     }
-    // ── Coleta faixas de preço (varejo/atacado) ───────────────
+
+    // ── Faixas de preço (varejo/atacado) ──────────────────────
     const _faixasPreco = _coletarFaixasPreco();
-    const _montagemConfig = _faixasPreco
-      ? { __tipo: "varejo", faixas_preco: _faixasPreco }
-      : null;
-    // ───────────────────────────────────────────────────────────
+
+    // Preserva montagem_config existente quando não há faixas ativas.
+    // Sem isso, editar uma pizza/montável/combo sem mexer em faixas
+    // apaga a configuração original do produto.
+    let _montagemConfig = null;
+    if (_faixasPreco) {
+      _montagemConfig = { __tipo: "varejo", faixas_preco: _faixasPreco };
+    } else if (id && _produtosMap[id]?.montagem_config) {
+      _montagemConfig = _produtosMap[id].montagem_config;
+    }
+
+    // ── Payload ───────────────────────────────────────────────
     const dados = {
       nome: document.getElementById("prod-nome").value,
       descricao: document.getElementById("prod-desc").value,
@@ -5112,21 +5419,17 @@ async function salvarProduto() {
       ativo: true,
       somente_balcao:
         document.getElementById("prod-somente-balcao")?.checked || false,
-      // ── Código de barras ──────────────────────────────────
       codigo_barras:
         document.getElementById("prod-codigo-barras")?.value?.trim() || null,
-      // ── Varejo ────────────────────────────────────────────
       unidade_venda:
         document.getElementById("prod-unidade-venda")?.value || null,
       destaque: document.getElementById("prod-destaque")?.checked || false,
-      // Estoque direto (sem vínculo com inventário)
       estoque_qtd: document.getElementById("prod-tem-estoque")?.checked
         ? parseInt(document.getElementById("prod-estoque-qtd")?.value) || 0
         : null,
       estoque_minimo: document.getElementById("prod-tem-estoque")?.checked
-        ? (parseInt(document.getElementById("prod-estoque-minimo")?.value) || null)
+        ? parseInt(document.getElementById("prod-estoque-minimo")?.value) || null
         : null,
-      // ── Preço de compra / custo ───────────────────────────
       preco_compra: (() => {
         const el = document.getElementById("prod-preco-compra");
         if (!el) return null;
@@ -5137,14 +5440,12 @@ async function salvarProduto() {
         const v = parseInt(raw, 10);
         return v > 0 ? v : null;
       })(),
-      // ── Perecível ─────────────────────────────────────────
       perecivel: document.getElementById("prod-perecivel")?.checked || false,
       data_validade:
         document.getElementById("prod-perecivel")?.checked &&
         document.getElementById("prod-data-validade")?.value
           ? document.getElementById("prod-data-validade").value
           : null,
-      // Com quantos dias de antecedência avisar antes do vencimento (7/15/30)
       dias_alerta_validade:
         parseInt(document.getElementById("prod-dias-alerta-validade")?.value) ||
         7,
@@ -5176,7 +5477,6 @@ async function salvarProduto() {
     if (prodIdSalvo && document.getElementById("secao-variacoes-estoque")) {
       await veSalvarVariacoes(prodIdSalvo);
     }
-    // ── Fim variações ─────────────────────────────────────────
 
     fecharModal("modal-produto");
     carregarProdutos();
@@ -17928,26 +18228,70 @@ function _faixaAtualizarPreview() {
 
 /**
  * Lê os inputs e retorna o objeto faixas_preco. Retorna null se inválido.
+ *
+ * Sincroniza automaticamente com o campo principal #prod-preco:
+ *  - Se o operador preencheu só o preço principal, herda como "unitario"
+ *  - Se o operador preencheu só a faixa, o preço principal herda a faixa
+ *  (evita salvar produtos com preco = 0, que quebram a exibição na loja)
  */
 function _coletarFaixasPreco() {
   const ativo = document.getElementById("prod-tem-faixas")?.checked;
   if (!ativo) return null;
 
-  const unitario = parseInt(document.getElementById("prod-faixa-unitario")?.value) || 0;
-  if (!unitario) return null;
+  const _faixaUniEl  = document.getElementById("prod-faixa-unitario");
+  const _precoMainEl = document.getElementById("prod-preco");
+
+  // ── Auto-sync 1: campo unitário vazio mas preço principal preenchido ──
+  if (_faixaUniEl && (!_faixaUniEl.value || _faixaUniEl.value === "0")) {
+    const _herdado = parseInt(
+      _precoMainEl?.dataset?.valorNumerico ||
+        (_precoMainEl?.value || "").replace(/\D/g, "") ||
+        "0",
+      10,
+    ) || 0;
+    if (_herdado > 0) _faixaUniEl.value = _herdado;
+  }
+
+  const unitario = parseInt(_faixaUniEl?.value) || 0;
+  if (!unitario) {
+    alert(
+      "⚠️ Para ativar preços por quantidade, informe o 'Preço unitário (1 un)' na seção de faixas.",
+    );
+    return null;
+  }
+
+  // ── Auto-sync 2: preço principal vazio mas faixa unitária preenchida ──
+  if (_precoMainEl && (!_precoMainEl.value || _precoMainEl.value === "0")) {
+    _precoMainEl.value = unitario.toLocaleString("es-PY");
+    _precoMainEl.dataset.valorNumerico = String(unitario);
+  }
 
   const faixa1_min   = parseInt(document.getElementById("prod-faixa1-min")?.value)   || null;
   const faixa1_preco = parseInt(document.getElementById("prod-faixa1-preco")?.value) || null;
   const faixa2_min   = parseInt(document.getElementById("prod-faixa2-min")?.value)   || null;
   const faixa2_preco = parseInt(document.getElementById("prod-faixa2-preco")?.value) || null;
 
-  // Valida mínimos
-  if (faixa1_min && faixa1_min < 2) return null;
-  if (faixa2_min && faixa1_min && faixa2_min <= faixa1_min) return null;
+  // ── Validações com aviso explícito (antes falhavam em silêncio) ──
+  if (faixa1_min && faixa1_min < 2) {
+    alert(
+      "⚠️ 'A partir de' da Faixa 1 precisa ser ≥ 2.\nA faixa de 1 unidade é o preço unitário base.",
+    );
+    return null;
+  }
+  if (faixa2_min && faixa1_min && faixa2_min <= faixa1_min) {
+    alert("⚠️ 'Atacado a partir de' deve ser maior que a 'Faixa 1'.");
+    return null;
+  }
 
   const out = { unitario };
-  if (faixa1_min && faixa1_preco) { out.faixa1_min = faixa1_min; out.faixa1_preco = faixa1_preco; }
-  if (faixa2_min && faixa2_preco) { out.faixa2_min = faixa2_min; out.faixa2_preco = faixa2_preco; }
+  if (faixa1_min && faixa1_preco) {
+    out.faixa1_min   = faixa1_min;
+    out.faixa1_preco = faixa1_preco;
+  }
+  if (faixa2_min && faixa2_preco) {
+    out.faixa2_min   = faixa2_min;
+    out.faixa2_preco = faixa2_preco;
+  }
 
   return out;
 }

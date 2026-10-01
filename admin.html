@@ -1012,6 +1012,42 @@
     </div>
   </div>
 
+    <!-- ===== HISTÓRICO DE BOLETINS DE FECHAMENTO ===== -->
+  <div class="card" style="margin-top: 20px; margin-bottom: 20px; padding: 0;" id="card-hist-fechamentos">
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #f0f0f0;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <div style="width:4px;height:20px;background:var(--primary);border-radius:2px"></div>
+        <h3 style="margin:0;color:#444;font-size:0.95rem;">📋 Histórico de Boletins de Fechamento</h3>
+        <span id="hist-fech-contador" style="background:#eef2ff;color:#4f46e5;font-size:0.75rem;font-weight:700;padding:2px 8px;border-radius:20px;display:none;"></span>
+      </div>
+      <button onclick="carregarHistoricoFechamentos()" class="btn btn-primary" style="font-size:0.83rem;padding:7px 14px;height:auto;">
+        <i class="fas fa-sync-alt"></i> Atualizar
+      </button>
+    </div>
+    <div style="overflow-x:auto">
+      <table class="table" style="margin:0;font-size:0.85rem;" id="tabela-hist-fechamentos">
+        <thead>
+          <tr>
+            <th style="white-space:nowrap">Sessão</th>
+            <th style="white-space:nowrap">Período</th>
+            <th>Operador</th>
+            <th style="text-align:right">Faturamento</th>
+            <th style="text-align:right">Resultado</th>
+            <th style="text-align:right">Dinheiro Gaveta</th>
+            <th style="text-align:center">Ações</th>
+          </tr>
+        </thead>
+        <tbody id="hist-fech-tbody">
+          <tr>
+            <td colspan="7" style="text-align:center;color:#bbb;padding:24px;font-size:0.85rem;">
+              Clique em "Atualizar" para carregar o histórico
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- ===== RELATÓRIO DETALHADO DE VENDAS ===== -->
   <div class="card" style="margin-top: 20px; margin-bottom: 20px;padding: 0;" id="card-relatorio-vendas">
     <div style="display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid #f0f0f0; flex-wrap:wrap; gap:8px;">
