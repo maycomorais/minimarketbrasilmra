@@ -802,7 +802,7 @@
                   <input type="number" id="balcao-frete" class="pdv-dir-input"
                     placeholder="Frete (Gs)" min="0" step="1000"
                     style="border-color:#27ae60;flex:1" oninput="atualizarCarrinhoPDV()" />
-                  <button onclick="calcularFretePDV()"
+                  <button id="btn-gps-pdv" onclick="calcularFretePDV()"
                     style="padding:6px 10px;background:#1a7a2e;color:#fff;border:none;
                            border-radius:5px;font-size:0.76rem;cursor:pointer;font-weight:700;white-space:nowrap">
                     📍 Rota
@@ -2855,9 +2855,9 @@
     <script src="subscriptionUI.js"></script>
     <script src="subscriptionAdmin.js"></script>
     <script src="varejoUtils.js"></script>
-    <script src="admin.js"></script>
     <script src="freteUtils.js"></script>
     <script src="filiais.js"></script>
+    <script src="admin.js"></script>
 
 <!-- ═══════════════════ ABA MENSALISTAS ═══════════════════ -->
 <div id="mensalistas" class="tab-content">
