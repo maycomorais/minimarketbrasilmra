@@ -3581,7 +3581,6 @@ async function fecharCaixaResumo() {
     return;
 
   // ── 1. Captura dados da sessão ANTES de qualquer operação ────────
-  //     (evita race condition com _carregarSessaoCaixa zerando a var)
   const sessaoId      = _sessaoCaixaAtiva.id;
   const abertoEm      = _sessaoCaixaAtiva.aberto_em;
   const valorAbertura = Number(_sessaoCaixaAtiva.valor_abertura || 0);
@@ -3676,78 +3675,36 @@ async function fecharCaixaResumo() {
         sessao_id:     sessaoId,
       }]);
 
-    // ── 7. Alerta final (usa os valores recém-calculados, não globais) ─
-    const totalEntradasLabel = r.total_suprimentos;
-    alert(
-      `📊 FECHAMENTO DA SESSÃO #${sessaoId}
-═══════════════════════════
-Período: ${new Date(abertoEm).toLocaleString("pt-BR")} → ${new Date(fechadoEm).toLocaleString("pt-BR")}
-
-Faturamento Total: ${fmt(r.faturamento)}
-📦 Pedidos: ${r.qtd_pedidos}
-
-💰 Por Método:
-  💵 Dinheiro:      ${fmt(r.total_efetivo)}
-  📱 Pix:           ${fmt(r.total_pix)}
-  💳 Cartão PY:     ${fmt(r.total_cartao)}
-  💳 Cartão BR:     ${fmt(r.total_cartao_br)}
-  🏦 Transferência: ${fmt(r.total_transferencia)}
-  📲 QR Paraguay:   ${fmt(r.total_qr_py)}${
-    r.total_multi_outros > 0
-      ? `\n  🔀 Multi/Outros:  ${fmt(r.total_multi_outros)}`
-      : ""
-  }
-
-🏍️ Custo Entregas: ${fmt(r.custo_entregas)}
-💸 Despesas:       ${fmt(r.total_despesas)}
-💸 Sangrias:       ${fmt(r.total_sangrias)}
-➕ Suprimentos:    ${fmt(totalEntradasLabel)}
-═══════════════════════════
-💵 RESULTADO OPERACIONAL: ${fmt(r.lucro_operacional)}
-═══════════════════════════
-🏦 Abertura de caixa:    ${fmt(valorAbertura)}
-💵 Vendas em dinheiro:   ${fmt(r.total_efetivo)}
-💸 Saídas em dinheiro:   ${fmt(r.total_despesas + r.total_sangrias)}
-──────────────────────────
-💰 DINHEIRO NA GAVETA:   ${fmt(r.dinheiro_gaveta)}
-═══════════════════════════
-Sessão encerrada com sucesso.`
-    );
-
-    // ── 7.5. Oferta de impressão imediata do boletim ──────────────
-    // Reutiliza os mesmos valores recém-calculados em `r` — sem
-    // nova query, garantindo que o boletim reflita exatamente o
-    // fechamento que acabou de acontecer.
-    if (confirm("🖨️ Deseja imprimir o boletim de fechamento agora?")) {
-      _abrirJanelaImpressaoFechamento({
-        sessao_id:           sessaoId,
-        usuario_email:       emailAtual,
-        usuario_nome:        nomeAtual,
-        aberto_em:           abertoEm,
-        fechado_em:          fechadoEm,
-        valor_abertura:      valorAbertura,
-        faturamento:         r.faturamento,
-        qtd_pedidos:         r.qtd_pedidos,
-        custo_entregas:      r.custo_entregas,
-        total_despesas:      r.total_despesas,
-        total_sangrias:      r.total_sangrias,
-        total_suprimentos:   r.total_suprimentos,
-        lucro_operacional:   r.lucro_operacional,
-        dinheiro_gaveta:     r.dinheiro_gaveta,
-        total_efetivo:       r.total_efetivo,
-        total_pix:           r.total_pix,
-        total_cartao:        r.total_cartao,
-        total_cartao_br:     r.total_cartao_br,
-        total_transferencia: r.total_transferencia,
-        total_qr_py:         r.total_qr_py,
-        total_multi_outros:  r.total_multi_outros,
-      });
-    }
+    // ── 7. 🔧 CORREÇÃO: modal com botão de impressão explícito.
+    //    Substitui o alert+confirm anteriores — o confirm() após um
+    //    alert() muito longo é auto-descartado por alguns navegadores
+    //    e o window.open() subsequente perdia o user gesture.
+    _mostrarModalFechamentoCaixa({
+      sessao_id:           sessaoId,
+      usuario_email:       emailAtual,
+      usuario_nome:        nomeAtual,
+      aberto_em:           abertoEm,
+      fechado_em:          fechadoEm,
+      valor_abertura:      valorAbertura,
+      faturamento:         r.faturamento,
+      qtd_pedidos:         r.qtd_pedidos,
+      custo_entregas:      r.custo_entregas,
+      total_despesas:      r.total_despesas,
+      total_sangrias:      r.total_sangrias,
+      total_suprimentos:   r.total_suprimentos,
+      lucro_operacional:   r.lucro_operacional,
+      dinheiro_gaveta:     r.dinheiro_gaveta,
+      total_efetivo:       r.total_efetivo,
+      total_pix:           r.total_pix,
+      total_cartao:        r.total_cartao,
+      total_cartao_br:     r.total_cartao_br,
+      total_transferencia: r.total_transferencia,
+      total_qr_py:         r.total_qr_py,
+      total_multi_outros:  r.total_multi_outros,
+    });
 
     // ── 8. Limpa estado local e atualiza UI ───────────────────────
     _sessaoCaixaAtiva = null;
-
-    
 
     [
       "card-faturamento",
@@ -3809,6 +3766,129 @@ Sessão encerrada com sucesso.`
       _btnFechar.style.opacity = "1";
     }
   }
+}
+
+/* ══════════════════════════════════════════════════════════════
+   MODAL DE FECHAMENTO DE CAIXA
+   Substitui o antigo alert() + confirm() no fim de fecharCaixaResumo().
+   Motivo: o confirm() disparado logo após um alert() muito longo era
+   auto-descartado por alguns navegadores, e o window.open() que vinha
+   depois perdia o "user gesture context" — o popup blocker matava a
+   janela de impressão silenciosamente.
+
+   Aqui o operador CLICA no botão "Imprimir Boletim", o que restaura
+   o user gesture e faz o window.open() abrir 100% das vezes.
+   ══════════════════════════════════════════════════════════════ */
+function _mostrarModalFechamentoCaixa(f) {
+  document.getElementById("_modal-fechamento")?.remove();
+
+  const fmt = (n) => "Gs " + Math.round(Number(n) || 0).toLocaleString("es-PY");
+  const fmtDt = (iso) => {
+    if (!iso) return "—";
+    return new Date(iso).toLocaleString("pt-BR", {
+      timeZone: "America/Asuncion",
+      day: "2-digit", month: "2-digit",
+      hour: "2-digit", minute: "2-digit",
+    });
+  };
+  const linha = (label, valor) =>
+    `<div style="display:flex;justify-content:space-between;font-size:0.85rem;color:#555;padding:3px 0">
+       <span>${label}</span>
+       <span style="font-weight:600;color:#334155">${fmt(valor)}</span>
+     </div>`;
+
+  const overlay = document.createElement("div");
+  overlay.id = "_modal-fechamento";
+  overlay.style.cssText =
+    "position:fixed;inset:0;background:rgba(0,0,0,0.75);z-index:99999;" +
+    "display:flex;align-items:center;justify-content:center;padding:16px;overflow-y:auto";
+
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:18px;max-width:480px;width:100%;max-height:92vh;
+                overflow:hidden;display:flex;flex-direction:column;
+                box-shadow:0 24px 80px rgba(0,0,0,0.4)">
+      <div style="background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;padding:20px 24px;text-align:center">
+        <div style="font-size:2.2rem;margin-bottom:4px">✅</div>
+        <div style="font-size:1.15rem;font-weight:800">Caixa Fechado!</div>
+        <div style="font-size:0.82rem;opacity:0.9;margin-top:4px">Sessão #${f.sessao_id}</div>
+      </div>
+
+      <div style="padding:20px 24px;overflow-y:auto;flex:1">
+        <div style="background:#f0f9ff;border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:0.82rem;color:#0369a1">
+          <b>Período:</b> ${fmtDt(f.aberto_em)} → ${fmtDt(f.fechado_em)}
+        </div>
+
+        <div style="margin-bottom:16px">
+          <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">
+            💰 Faturamento
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:0.9rem;margin-bottom:4px">
+            <span style="color:#555">Faturamento Total</span>
+            <strong>${fmt(f.faturamento)}</strong>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:0.9rem">
+            <span style="color:#555">📦 Pedidos</span>
+            <strong>${f.qtd_pedidos}</strong>
+          </div>
+        </div>
+
+        <div style="margin-bottom:16px">
+          <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">
+            💳 Por Forma de Pagamento
+          </div>
+          ${linha("💵 Dinheiro", f.total_efetivo)}
+          ${linha("📱 Pix", f.total_pix)}
+          ${linha("💳 Cartão PY", f.total_cartao)}
+          ${linha("💳 Cartão BR", f.total_cartao_br)}
+          ${linha("🏦 Transferência", f.total_transferencia)}
+          ${linha("📱 QR Paraguay", f.total_qr_py)}
+          ${(f.total_multi_outros || 0) > 0 ? linha("🔀 Multi/Outros", f.total_multi_outros) : ""}
+        </div>
+
+        <div style="margin-bottom:16px">
+          <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">
+            📋 Movimentações
+          </div>
+          ${linha("🏍️ Custo Entregas", f.custo_entregas)}
+          ${linha("💸 Despesas", f.total_despesas)}
+          ${linha("💸 Sangrias", f.total_sangrias)}
+          ${linha("➕ Suprimentos", f.total_suprimentos)}
+        </div>
+
+        <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:12px;padding:14px 16px;margin-bottom:12px">
+          <div style="display:flex;justify-content:space-between;font-size:1rem;font-weight:800;color:#166534">
+            <span>💵 Resultado Operacional</span>
+            <span>${fmt(f.lucro_operacional)}</span>
+          </div>
+        </div>
+
+        <div style="background:#fff7ed;border:2px solid #fdba74;border-radius:12px;padding:14px 16px">
+          <div style="display:flex;justify-content:space-between;font-size:1rem;font-weight:800;color:#9a3412">
+            <span>💰 Dinheiro na Gaveta</span>
+            <span>${fmt(f.dinheiro_gaveta)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div style="padding:16px 24px;display:flex;gap:10px;border-top:1px solid #f0f0f0;background:#fafafa">
+        <button id="_btn-fechar-modal-fech"
+          style="flex:1;padding:14px;background:#fff;color:#64748b;border:1.5px solid #e2e8f0;border-radius:10px;font-weight:700;font-size:0.9rem;cursor:pointer">
+          Fechar
+        </button>
+        <button id="_btn-imprimir-fech"
+          style="flex:2;padding:14px;background:linear-gradient(135deg,#1a7a2e,#145a22);color:#fff;border:none;border-radius:10px;font-weight:700;font-size:0.95rem;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 14px rgba(26,122,46,0.35)">
+          <i class="fas fa-print"></i> Imprimir Boletim
+        </button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+  overlay.querySelector("#_btn-fechar-modal-fech").onclick = () => overlay.remove();
+  overlay.querySelector("#_btn-imprimir-fech").onclick = () => {
+    overlay.remove();
+    _abrirJanelaImpressaoFechamento(f);   // chamada com user gesture válido
+  };
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -9408,6 +9488,9 @@ let _taxaCreditoPDV = 4.98;
 let _cartaoBRTipoPDV = "debito";
 
 async function carregarPDV() {
+  // 🔧 Limpa IDs duplicados ANTES de qualquer getElementById
+  _pdvLimparElementosDuplicados();
+
   // PDV carrega TODOS os produtos ativos (inclui pausado=null e pausado=false)
   // .neq("pausado", true) exclui NULLs no PostgREST — usar .or() para incluir
   const { data } = await supa
@@ -9434,6 +9517,7 @@ async function carregarPDV() {
   if (cfg?.cotacao_real) _cotacaoPDV = Number(cfg.cotacao_real);
   if (cfg?.taxa_debito != null) _taxaDebitoPDV = Number(cfg.taxa_debito);
   if (cfg?.taxa_credito != null) _taxaCreditoPDV = Number(cfg.taxa_credito);
+
   // Aplica visibilidade das formas de pagamento no PDV
   const { data: featCfg } = await supa
     .from("configuracoes")
@@ -9459,12 +9543,21 @@ async function carregarPDV() {
 /**
  * Atualiza o mini-painel de status/abertura de caixa dentro do PDV.
  * Chamado após _carregarSessaoCaixa() para refletir o estado atual.
+ *
+ * 🔧 Os botões Sangria / Suprimento / Despesa só aparecem quando há
+ *    sessão de caixa ABERTA — porque salvarMovimentacaoCaixa() exige
+ *    _sessaoCaixaAtiva para registrar a movimentação.
  */
 function _pdvAtualizarPainelCaixa() {
-  const elStatus = document.getElementById("pdv-status-caixa");
-  const btnAbrir = document.getElementById("pdv-btn-abrir-caixa");
-  const btnFechar = document.getElementById("pdv-btn-fechar-caixa");
+  const elStatus       = document.getElementById("pdv-status-caixa");
+  const btnAbrir       = document.getElementById("pdv-btn-abrir-caixa");
+  const btnFechar      = document.getElementById("pdv-btn-fechar-caixa");
+  const btnSuprimento  = document.getElementById("pdv-btn-suprimento");
+  const btnSangria     = document.getElementById("pdv-btn-sangria");
+  const btnDespesa     = document.getElementById("pdv-btn-despesa");
   if (!elStatus) return;
+
+  const botoesMov = [btnSuprimento, btnSangria, btnDespesa];
 
   if (_sessaoCaixaAtiva) {
     const dAbr = new Date(_sessaoCaixaAtiva.aberto_em).toLocaleString("pt-BR", {
@@ -9475,11 +9568,17 @@ function _pdvAtualizarPainelCaixa() {
       timeZone: "America/Asuncion",
     });
     elStatus.innerHTML = `<span style="color:#27ae60">🟢 Aberto desde ${dAbr}</span>`;
+
+    // Caixa aberto → esconde "Abrir", mostra movimentações + "Fechar"
     if (btnAbrir) btnAbrir.style.display = "none";
-    if (btnFechar) btnFechar.style.display = "flex";
+    botoesMov.forEach((b) => { if (b) b.style.display = "inline-flex"; });
+    if (btnFechar) btnFechar.style.display = "inline-flex";
   } else {
     elStatus.innerHTML = `<span style="color:#e74c3c">🔴 Caixa fechado — abra para registrar vendas</span>`;
-    if (btnAbrir) btnAbrir.style.display = "flex";
+
+    // Caixa fechado → mostra "Abrir", esconde movimentações + "Fechar"
+    if (btnAbrir) btnAbrir.style.display = "inline-flex";
+    botoesMov.forEach((b) => { if (b) b.style.display = "none"; });
     if (btnFechar) btnFechar.style.display = "none";
   }
 }
@@ -9637,6 +9736,22 @@ function _criarCardPDV(p) {
   return card;
 }
 
+/**
+ * Remove elementos duplicados no PDV.
+ * O HTML tem IDs repetidos (pdv-f2-badge, pdv-f2-btn, pdv-busca-resultados),
+ * o que faz getElementById pegar o PRIMEIRO — que está solto na coluna,
+ * sem o position:absolute correto. Mantém apenas o ÚLTIMO (o que está
+ * dentro de .pdv-busca-wrap).
+ */
+function _pdvLimparElementosDuplicados() {
+  ["pdv-f2-badge", "pdv-f2-btn", "pdv-busca-resultados"].forEach((id) => {
+    const els = document.querySelectorAll(`[id="${id}"]`);
+    if (els.length > 1) {
+      for (let i = 0; i < els.length - 1; i++) els[i].remove();
+    }
+  });
+}
+
 // ── PDV — FUNÇÕES AUXILIARES ───────────────────────────────────────
 
 // Estado F2 (consultar preço sem adicionar ao carrinho)
@@ -9644,15 +9759,38 @@ let _pdvF2Mode = false;
 
 function togglePdvF2Mode() {
   _pdvF2Mode = !_pdvF2Mode;
-  const btn = document.getElementById("pdv-f2-btn");
-  const badge = document.getElementById("pdv-f2-badge");
-  if (btn) btn.classList.toggle("active", _pdvF2Mode);
+
+  const btn    = document.getElementById("pdv-f2-btn");
+  const badge  = document.getElementById("pdv-f2-badge");
+  const input  = document.getElementById("pdv-busca");
+
+  if (btn)   btn.classList.toggle("active", _pdvF2Mode);
   if (badge) badge.style.display = _pdvF2Mode ? "inline-flex" : "none";
-  const busca = document.getElementById("pdv-busca");
-  if (busca) {
-    busca.focus();
-    busca.select();
+
+  // ── Feedback visual no campo de busca ──
+  // Borda azul + placeholder diferente deixam ÓBVIO que o modo está ativo
+  if (input) {
+    if (_pdvF2Mode) {
+      input.style.borderColor = "#1565c0";
+      input.style.boxShadow   = "0 0 0 3px rgba(21,101,192,0.15)";
+      input.placeholder       = "🔍 MODO PREÇO (F2) — consultar sem adicionar";
+    } else {
+      input.style.borderColor = "";
+      input.style.boxShadow   = "";
+      input.placeholder       = "🔍 Buscar produto, código ou escanear...";
+    }
+    input.focus();
+    input.select();
   }
+
+  // ── Toast informativo na ativação/desativação ──
+  _pdvMostrarToast(
+    _pdvF2Mode
+      ? "🔍 Modo F2 ativo — apenas consulta, não adiciona ao carrinho"
+      : "✅ Modo F2 desativado — voltou ao normal",
+    _pdvF2Mode ? "#1565c0" : "#16a34a",
+    2500,
+  );
 }
 
 async function pdvBuscaKeydown(e) {
@@ -9818,16 +9956,7 @@ function filtrarPDV(valor) {
   const colEsq = document.querySelector(".pdv-col-esq");
   const query  = (valor || "").trim();
 
-  // em filtrarPDV — quando há texto:
-  document.querySelector(".pdv-col-esq")?.classList.add("pdv-buscando");
-
-  // em filtrarPDV — quando não há texto (busca vazia):
-  document.querySelector(".pdv-col-esq")?.classList.remove("pdv-buscando");
-
-  // em _pdvSelecionarResultado — após adicionar o item:
-  document.querySelector(".pdv-col-esq")?.classList.remove("pdv-buscando");
-
-  // Sem texto → fechar dropdown
+  // Sem texto → fecha dropdown e sai do modo busca
   if (!query) {
     dropdown.style.display = "none";
     dropdown.innerHTML = "";
@@ -9836,11 +9965,12 @@ function filtrarPDV(valor) {
     return;
   }
 
-  // ── Busca ativa → coluna em modo resultado ──
+  // ── Busca ativa → ativa o modo "pdv-buscando" UMA vez ──
+  // (Antes essa função adicionava e removia a classe na mesma chamada,
+  //  o que a deixava sempre DESATIVADA. Agora só adiciona.)
   colEsq?.classList.add("pdv-buscando");
-  dropdown.style.display = "block";
 
-   const ql = query.toLowerCase();
+  const ql = query.toLowerCase();
   const resultados = (produtosCachePDV || [])
     .filter((p) => p.ativo !== false &&
       (p.nome.toLowerCase().includes(ql) ||
@@ -9852,6 +9982,7 @@ function filtrarPDV(valor) {
 
   if (!resultados.length) {
     dropdown.innerHTML = `<div class="pdv-resultado-vazio">Nenhum produto encontrado para "<b>${query}</b>"</div>`;
+    dropdown.style.display = "block";
     return;
   }
 
@@ -9892,6 +10023,35 @@ function filtrarPDV(valor) {
 }
 
 function _pdvSelecionarResultado(p) {
+  // ── Modo F2 (consulta de preço): apenas exibe, NÃO adiciona ao carrinho ──
+  if (_pdvF2Mode) {
+    // Extrai o preço — considera venda por kg
+    let cfg = p.montagem_config;
+    if (typeof cfg === "string") {
+      try { cfg = JSON.parse(cfg); } catch (_) { cfg = null; }
+    }
+    const isKg = cfg && !Array.isArray(cfg) && cfg.__tipo === "kg";
+    const preco = isKg ? (cfg.preco_kg || p.preco || 0) : (p.preco || 0);
+    const precoFmt = `Gs ${preco.toLocaleString("es-PY")}${isKg ? "/kg" : ""}`;
+
+    // Toast grande com o preço (fica visível por 3.5s)
+    _pdvMostrarToast(
+      `🔍 ${p.nome} — ${precoFmt}`,
+      "#1565c0",
+      3500,
+    );
+
+    // Limpa input, fecha dropdown, mas MANTÉM o modo F2 ativo para a próxima consulta
+    const input = document.getElementById("pdv-busca");
+    if (input) { input.value = ""; input.focus(); }
+    const dropdown = document.getElementById("pdv-busca-resultados");
+    if (dropdown) { dropdown.style.display = "none"; dropdown.innerHTML = ""; }
+    document.querySelector(".pdv-col-esq")?.classList.remove("pdv-buscando");
+    _pdvDropdownIdx = -1;
+    return; // ← sai sem adicionar
+  }
+
+  // ── Modo normal: adiciona ao carrinho ─────────────────────────────────
   adicionarItemPDV(p);
   const input = document.getElementById("pdv-busca");
   if (input) { input.value = ""; input.focus(); }
@@ -9899,15 +10059,6 @@ function _pdvSelecionarResultado(p) {
   if (dropdown) { dropdown.style.display = "none"; dropdown.innerHTML = ""; }
   document.querySelector(".pdv-col-esq")?.classList.remove("pdv-buscando");
   _pdvDropdownIdx = -1;
-
-  // em filtrarPDV — quando há texto:
-  document.querySelector(".pdv-col-esq")?.classList.add("pdv-buscando");
-
-  // em filtrarPDV — quando não há texto (busca vazia):
-  document.querySelector(".pdv-col-esq")?.classList.remove("pdv-buscando");
-
-  // em _pdvSelecionarResultado — após adicionar o item:
-  document.querySelector(".pdv-col-esq")?.classList.remove("pdv-buscando");
 }
 
 function _pdvFecharDropdown() {
@@ -14850,9 +15001,6 @@ async function _descontarEstoqueVenda(pedidoId, itensDireto) {
 /* ══════════════════════════════════════════════════════════════
    BUG #7 CORRIGIDO — Repõe estoque quando um pedido é cancelado
    ══════════════════════════════════════════════════════════════ */
-// CORREÇÃO: repõe estoque tanto via inventario_id quanto via estoque_qtd
-// (mesmo bug do desconto na venda existia aqui — produtos cadastrados com
-// controle direto em produtos.estoque_qtd nunca recebiam a reposição).
 async function _reporEstoqueCancelamento(pedidoId) {
   const falhas = [];
   try {
@@ -14880,13 +15028,34 @@ async function _reporEstoqueCancelamento(pedidoId) {
       qtdPorProduto[pid] = (qtdPorProduto[pid] || 0) + (item.qtd || item.q || 1);
     });
 
+    // ── 🔧 CORREÇÃO: query que estava FALTANDO (era a causa do
+    //    erro "prods is not defined"). Precisa vir ANTES do uso de `prods`. ──
+    const { data: prods, error: errProds } = await supa
+      .from("produtos")
+      .select("id, nome, inventario_id, estoque_qtd, ativo")
+      .in("id", prodIds);
+
+    if (errProds) {
+      falhas.push({ tipo: "query_produtos", motivo: errProds.message });
+      return { ok: false, falhas };
+    }
+    if (!prods?.length) {
+      falhas.push({
+        tipo: "produtos_nao_encontrados",
+        motivo: `IDs: ${prodIds.join(", ")}`,
+      });
+      return { ok: false, falhas };
+    }
+    // ─────────────────────────────────────────────────────────────
+
     // ── Caminho 1: inventario_id ──────────────────────────────────────
     const reposicoes = {};
     prods.forEach((prod) => {
       if (!prod.inventario_id) return;
       const qtd = qtdPorProduto[prod.id];
       if (!qtd) return;
-      reposicoes[prod.inventario_id] = (reposicoes[prod.inventario_id] || 0) + qtd;
+      reposicoes[prod.inventario_id] =
+        (reposicoes[prod.inventario_id] || 0) + qtd;
     });
 
     if (Object.keys(reposicoes).length > 0) {
@@ -14906,18 +15075,21 @@ async function _reporEstoqueCancelamento(pedidoId) {
           falhas.push({
             tipo: "inventario",
             id: est.id,
-            motivo: _errInv?.message || "0 linhas afetadas (possível bloqueio de RLS)",
+            motivo:
+              _errInv?.message || "0 linhas afetadas (possível bloqueio de RLS)",
           });
         }
         await supa
           .from("inventario_movimentos")
-          .insert([{
-            inventario_id: est.id,
-            tipo: "ajuste",
-            quantidade: reposicoes[est.id],
-            motivo: `Cancelamento — Pedido #${pedidoId}`,
-            usuario_email: "sistema",
-          }])
+          .insert([
+            {
+              inventario_id: est.id,
+              tipo: "ajuste",
+              quantidade: reposicoes[est.id],
+              motivo: `Cancelamento — Pedido #${pedidoId}`,
+              usuario_email: "sistema",
+            },
+          ])
           .then(() => {})
           .catch(() => {});
       }
@@ -14946,12 +15118,17 @@ async function _reporEstoqueCancelamento(pedidoId) {
           tipo: "produto",
           id: prod.id,
           nome: prod.nome,
-          motivo: _errProd?.message || "0 linhas afetadas (possível bloqueio de RLS)",
+          motivo:
+            _errProd?.message || "0 linhas afetadas (possível bloqueio de RLS)",
         });
       }
     }
+
     if (falhas.length) {
-      console.error(`❌ Falha ao repor estoque — pedido cancelado #${pedidoId}:`, falhas);
+      console.error(
+        `❌ Falha ao repor estoque — pedido cancelado #${pedidoId}:`,
+        falhas,
+      );
     } else {
       console.log(`✅ Estoque reposto: pedido cancelado #${pedidoId}`);
     }

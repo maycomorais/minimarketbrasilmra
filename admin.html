@@ -610,19 +610,45 @@
           <h2 class="section-title" style="margin:0" data-i18n="pdv.title">🏪 PDV — Caixa</h2>
         </div>
 
-        <!-- ===== PAINEL DE ABERTURA DE CAIXA (PDV) ===== -->
+                <!-- ===== PAINEL DE ABERTURA DE CAIXA (PDV) ===== -->
         <div id="pdv-painel-caixa" style="margin:12px 16px 4px;padding:14px 18px;background:#fff;border:1px solid #e2e8f0;border-radius:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
           <div style="display:flex;align-items:center;gap:10px">
             <div style="width:4px;height:20px;background:var(--primary,#1a7a2e);border-radius:2px"></div>
             <span style="font-weight:700;font-size:0.95rem;color:#334155" data-i18n="pdv.controle_caixa">Controle de Caixa</span>
             <span id="pdv-status-caixa" style="font-size:0.82rem;color:#e74c3c" data-i18n="pdv.caixa_fechado">🔴 Caixa fechado</span>
           </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+
+            <!-- Botão Abrir Caixa (aparece quando fechado) -->
             <button id="pdv-btn-abrir-caixa"
               onclick="abrirModalCaixa('abertura')"
               style="padding:9px 20px;background:linear-gradient(135deg,#1a7a2e,#145a22);color:#fff;border:none;border-radius:9px;font-weight:700;font-size:0.88rem;cursor:pointer;display:flex;align-items:center;gap:6px">
               <i class="fas fa-door-open"></i> <span data-i18n="pdv.abrir_caixa">Abrir Caixa</span>
             </button>
+
+            <!-- Botões de movimentação (aparecem quando aberto) -->
+            <button id="pdv-btn-suprimento"
+              onclick="abrirModalCaixa('suprimento')"
+              style="padding:9px 16px;background:#3498db;color:#fff;border:none;border-radius:9px;font-weight:700;font-size:0.85rem;cursor:pointer;display:none;align-items:center;gap:6px"
+              title="Adicionar dinheiro ao caixa">
+              <i class="fas fa-plus-circle"></i> <span data-i18n="fin.suprimento_btn">Suprimento</span>
+            </button>
+
+            <button id="pdv-btn-sangria"
+              onclick="abrirModalCaixa('sangria')"
+              style="padding:9px 16px;background:#f39c12;color:#fff;border:none;border-radius:9px;font-weight:700;font-size:0.85rem;cursor:pointer;display:none;align-items:center;gap:6px"
+              title="Retirar dinheiro do caixa">
+              <i class="fas fa-hand-holding-usd"></i> <span data-i18n="fin.sangria_btn">Sangria</span>
+            </button>
+
+            <button id="pdv-btn-despesa"
+              onclick="abrirModalCaixa('despesa')"
+              style="padding:9px 16px;background:#e67e22;color:#fff;border:none;border-radius:9px;font-weight:700;font-size:0.85rem;cursor:pointer;display:none;align-items:center;gap:6px"
+              title="Registrar uma despesa do caixa">
+              <i class="fas fa-file-invoice-dollar"></i> <span data-i18n="fin.despesa_btn">Despesa</span>
+            </button>
+
+            <!-- Botão Fechar Caixa (aparece quando aberto) -->
             <button id="pdv-btn-fechar-caixa"
               onclick="fecharCaixaResumo()"
               style="padding:9px 20px;background:#c0392b;color:#fff;border:none;border-radius:9px;font-weight:700;font-size:0.88rem;cursor:pointer;display:none;align-items:center;gap:6px">

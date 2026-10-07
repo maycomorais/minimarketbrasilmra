@@ -620,7 +620,8 @@ select.form-control, select.input-modern {
     display: flex;
     flex-direction: column;
     background: #fff;
-    overflow: hidden;
+    overflow: visible;      /* 🔧 era "hidden" — cortava o dropdown */
+    position: relative;     /* 🔧 âncora para o dropdown absolute */
 }
 
 /* Busca de código de barras (sem grid de produtos abaixo) */
@@ -670,13 +671,30 @@ select.form-control, select.input-modern {
     border-top: none;
     border-radius: 0 0 10px 10px;
     box-shadow: 0 8px 24px rgba(0,0,0,0.15);
-    z-index: 999;
+    z-index: 99999;      /* 🔧 era 999 — subiu para ficar acima de tudo */
     max-height: 420px;
     overflow-y: auto;
     scrollbar-width: thin;
 }
 .pdv-busca-dropdown::-webkit-scrollbar { width: 4px; }
 .pdv-busca-dropdown::-webkit-scrollbar-thumb { background: #ddd; border-radius: 4px; }
+
+/* 🔧 Modo busca: mantém dropdown FLUTUANTE acima dos itens do carrinho.
+   (A regra anterior forçava position:static, prendendo-o dentro da coluna) */
+.pdv-col-esq.pdv-buscando .pdv-busca-dropdown {
+    position: absolute !important;
+    top: calc(100% - 2px) !important;
+    left: 10px !important;
+    right: 10px !important;
+    z-index: 99999 !important;
+    max-height: 420px !important;
+    overflow-y: auto !important;
+    border: 2px solid var(--primary, #1a7a2e) !important;
+    border-top: none !important;
+    border-radius: 0 0 10px 10px !important;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.22) !important;
+    background: #fff !important;
+}
 
 .pdv-resultado-item {
     display: flex;
@@ -6248,27 +6266,34 @@ td.pdv-item-card:last-child {
 }
 
 /* ═══════════════════════════════════════════════════════════
-   BUSCA PDV — modo resultado (imagem 1)
-   ═══════════════════════════════════════════════════════════ */
+   BUSCA PDV — modo resultado
+   ═══════════════════════════════════════════════════════════
+   ATENÇÃO: NÃO redefinir `position: static` aqui. Isso prendia
+   o dropdown dentro da coluna e empurrava os itens do carrinho.
+   O dropdown precisa continuar `position: absolute` (ver regra
+   `.pdv-busca-dropdown` acima) para flutuar sobre o conteúdo. */
 
-/* Esconde mesas + lista do carrinho durante a busca */
+/* Esconde mesas + lista do carrinho enquanto a busca está ativa */
 .pdv-col-esq.pdv-buscando .pdv-mesas-bar,
 .pdv-col-esq.pdv-buscando .pdv-dir-lista-wrap {
   display: none !important;
 }
 
-/* Dropdown vira bloco flexível, não flutuante */
+/* Reforça z-index/posição absoluta quando em modo busca.
+   Mantém o dropdown FLUTUANTE — nada de `position: static`. */
 .pdv-col-esq.pdv-buscando .pdv-busca-dropdown {
-  position: static !important;
-  top: auto !important; left: auto !important; right: auto !important;
-  flex: 1 1 auto;
-  min-height: 0;
-  max-height: none !important;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  box-shadow: none;
-  margin-top: 6px;
-  overflow-y: auto;
+  position: absolute !important;
+  top: calc(100% - 2px) !important;
+  left: 10px !important;
+  right: 10px !important;
+  z-index: 99999 !important;
+  max-height: 420px !important;
+  overflow-y: auto !important;
+  border: 2px solid var(--primary, #1a7a2e) !important;
+  border-top: none !important;
+  border-radius: 0 0 10px 10px !important;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.22) !important;
+  background: #fff !important;
 }
 
 /* Cards de resultado com respiro igual à referência */
