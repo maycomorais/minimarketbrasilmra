@@ -9376,10 +9376,58 @@ function abrirModalAlterarSenha() {
 
 function _wlToggleSenha(inputId, spanId) {
   const inp = document.getElementById(inputId);
-  const sp = document.getElementById(spanId);
+  const sp  = document.getElementById(spanId);
   if (!inp) return;
   inp.type = inp.type === "password" ? "text" : "password";
   if (sp) sp.textContent = inp.type === "password" ? "👁" : "🙈";
+}
+
+/**
+ * Avalia a força da senha segundo a política do sistema:
+ *   - Mínimo 8 caracteres
+ *   - Pelo menos 1 letra minúscula
+ *   - Pelo menos 1 letra maiúscula
+ *   - Pelo menos 1 número
+ *   - Pelo menos 1 caractere especial
+ * Retorna `true` somente se TODOS os critérios forem atendidos.
+ */
+function _wlAvaliarSenha(v) {
+  v = v || '';
+  const checks = [
+    v.length >= 8,          // c1 — mínimo
+    /[a-z]/.test(v),        // c2 — minúscula
+    /[A-Z]/.test(v),        // c3 — maiúscula
+    /\d/.test(v),           // c4 — número
+    /[^A-Za-z0-9]/.test(v), // c5 — especial
+  ];
+  const txts   = ['Mín. 8 caracteres','Minúscula','Maiúscula','Número','Caractere especial'];
+  const cores  = ['#e2e8f0','#ef4444','#f97316','#eab308','#22c55e'];
+  const labels = ['','Fraca 😬','Razoável 😐','Boa 👍','Forte 💪','Excelente 🔒'];
+  const score  = checks.filter(Boolean).length;
+
+  // Atualiza critérios individuais — admin tem 5 itens
+  checks.forEach((ok, i) => {
+    const el = document.getElementById('wl-c' + (i + 1));
+    if (!el) return;
+    el.textContent = (ok ? '✓ ' : '✗ ') + txts[i];
+    el.style.color = ok ? '#22c55e' : '#bbb';
+  });
+
+  // Barra de força — admin tem 4 segmentos (vou manter 4, mapeando 5 critérios)
+  // score 0-1 → 0 barras | 2 → 1 | 3 → 2 | 4 → 3 | 5 → 4 (cheio)
+  const barras = score <= 1 ? 0 : score - 1;
+  for (let i = 1; i <= 4; i++) {
+    const b = document.getElementById('wl-b' + i);
+    if (b) b.style.background = i <= barras ? cores[score] : '#e2e8f0';
+  }
+
+  const fl = document.getElementById('wl-forca-lbl');
+  if (fl) {
+    fl.textContent = labels[score];
+    fl.style.color = cores[score];
+  }
+  _wlVerificarMatch();
+  return score === 5;
 }
 
 function _wlAvaliarSenha(v) {
@@ -9432,18 +9480,19 @@ function _wlVerificarMatch() {
 }
 
 async function wlSalvarNovaSenha() {
-  const nova = document.getElementById("wl-nova-senha")?.value || "";
-  const conf = document.getElementById("wl-conf-senha")?.value || "";
-  const msgEl = document.getElementById("wl-msg-senha");
-  const showErr = (t) => {
-    msgEl.textContent = t;
-    msgEl.style.display = "block";
-  };
+  const nova   = document.getElementById("wl-nova-senha")?.value || "";
+  const conf   = document.getElementById("wl-conf-senha")?.value || "";
+  const msgEl  = document.getElementById("wl-msg-senha");
+  const showErr = (t) => { msgEl.textContent = t; msgEl.style.display = "block"; };
   msgEl.style.display = "none";
 
-  if (nova.length < 6)
-    return showErr("A senha deve ter pelo menos 6 caracteres.");
-  if (nova !== conf) return showErr("As senhas não coincidem.");
+  // ── Política de senha forte ─────────────────────────────────────
+  if (nova.length < 8)             return showErr("A senha deve ter pelo menos 8 caracteres.");
+  if (!/[a-z]/.test(nova))         return showErr("Falta ao menos uma letra minúscula.");
+  if (!/[A-Z]/.test(nova))         return showErr("Falta ao menos uma letra maiúscula.");
+  if (!/\d/.test(nova))            return showErr("Falta ao menos um número.");
+  if (!/[^A-Za-z0-9]/.test(nova))  return showErr("Falta ao menos um caractere especial (ex: !@#$%).");
+  if (nova !== conf)               return showErr("As senhas não coincidem.");
 
   const btn = document.getElementById("wl-btn-salvar-senha");
   if (btn) {
