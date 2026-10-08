@@ -201,12 +201,15 @@ document.addEventListener("DOMContentLoaded", async () => {
     carregarMotoboysSelect();
 
     // ── Controle de Assinatura (barra de aviso / bloqueio) ──
+    // Passa `perfil` explicitamente — sem isso, SubscriptionUI depende
+    // de window.perfilUsuario, que pode estar null no momento do init.
     if (typeof SubscriptionUI !== "undefined") {
       SubscriptionUI.inicializar({
         supabaseUrl: typeof _SUPABASE_URL !== "undefined" ? _SUPABASE_URL : "",
         supabaseKey: typeof _SUPABASE_KEY !== "undefined" ? _SUPABASE_KEY : "",
         contatoFone: "595976771714",
         contatoNome: "SuporteLinkPY",
+        perfil: perfilUsuario,   // ← garante que adminMaster não seja bloqueado
       });
     }
 
@@ -16306,39 +16309,64 @@ async function excluirDespesa(id) {
 }
 // ══════════════════════════════════════════════════════════════
 //  VERIFICAÇÃO DE CONTRATO
-//  adminMaster: bypass total.
-//  dono: exibe overlay bloqueante no admin.html até assinar.
-//  outros cargos: bypass (não são parte do contrato).
+//  Regras:
+//   • adminMaster → bypass total (nunca vê contrato).
+//   • dono        → vê contrato APENAS se ainda não assinou.
+//   • outros      → bypass (não são parte do contrato).
+//  Fail-open: qualquer erro de leitura NÃO bloqueia o painel.
 // ══════════════════════════════════════════════════════════════
 async function verificarContratoAdmin(session) {
+  if (!session?.user?.id) return;
+
   try {
-    const { data: perfil } = await supa
+    // ── 1. Busca o cargo do usuário. Se a query falhar, NÃO assume "dono". ──
+    const { data: perfil, error: errPerfil } = await supa
       .from("perfis_acesso")
       .select("cargo")
       .eq("id", session.user.id)
-      .maybeSingle();
+      .limit(1);
 
-    const cargo = perfil?.cargo || "dono";
+    if (errPerfil || !perfil?.length || !perfil[0]?.cargo) {
+      console.warn(
+        "[verificarContratoAdmin] Não foi possível determinar o cargo — pulando verificação (fail-open).",
+        errPerfil?.message || "sem registro em perfis_acesso",
+      );
+      return;
+    }
 
-    // adminMaster e outros cargos não precisam assinar
-    if (cargo === "adminMaster") return;
+    const cargo = perfil[0].cargo;
+
+    // ── 2. Só "dono" assina contrato. Todos os demais passam direto. ──
     if (cargo !== "dono") return;
 
-    // Verifica se o dono já aceitou
-    const { data } = await supa
+    // ── 3. Verifica se o dono já aceitou.
+    //    Usa .limit(1) em vez de .maybeSingle() — assim múltiplos registros
+    //    históricos de aceite NÃO causam erro PGRST116 (que zerava `data`
+    //    e fazia o contrato reaparecer). ──
+    const { data: aceites, error: errAceite } = await supa
       .from("contratos_aceites")
       .select("id")
       .eq("usuario_id", session.user.id)
       .eq("aceito", true)
-      .maybeSingle();
+      .limit(1);
 
-    if (!data) {
-      // Ainda não assinou — exibe overlay bloqueante no próprio admin
-      _admMostrarContratoOverlay(session);
+    if (errAceite) {
+      // Erro de leitura → fail-open, não bloqueia o painel
+      console.warn(
+        "[verificarContratoAdmin] Erro ao consultar aceites — pulando verificação.",
+        errAceite.message,
+      );
+      return;
     }
+
+    // Se achou ao menos 1 aceite → já assinou. Nunca mais mostra.
+    if (aceites && aceites.length > 0) return;
+
+    // ── 4. Nunca aceitou → mostra overlay de assinatura. ──
+    _admMostrarContratoOverlay(session);
   } catch (e) {
-    // Fail-open: se erro ao verificar, não bloqueia o admin
-    console.warn("verificarContratoAdmin error:", e.message);
+    // Fail-open: nunca bloqueia por exceção interna
+    console.warn("[verificarContratoAdmin] Erro inesperado:", e.message);
   }
 }
 
@@ -16434,7 +16462,7 @@ function admToggleBtnAceitar() {
 
 async function admAceitarContrato() {
   const session = window._admContratoSession;
-  if (!session) return;
+  if (!session?.user?.id) return;
 
   const nome = document.getElementById("adm-c-nome")?.value?.trim();
   const doc = document.getElementById("adm-c-doc")?.value?.trim();
@@ -16451,44 +16479,54 @@ async function admAceitarContrato() {
   }
 
   try {
+    // Coleta IP (falha silenciosa — não impede a assinatura)
     let ip = "";
     try {
       const r = await fetch("https://api.ipify.org?format=json");
       ip = (await r.json()).ip || "";
     } catch (_) {}
 
-    const { error } = await supa.from("contratos_aceites").insert([
-      {
-        usuario_id: session.user.id,
-        aceito: true,
-        nome_assinante: nome,
-        doc_assinante: doc,
-        ip_assinante: ip,
-        user_agent: navigator.userAgent,
-        aceito_em: new Date().toISOString(),
-      },
-    ]);
+    const payload = {
+      usuario_id: session.user.id,
+      aceito: true,
+      nome_assinante: nome,
+      doc_assinante: doc,
+      ip_assinante: ip,
+      user_agent: navigator.userAgent,
+      aceito_em: new Date().toISOString(),
+    };
 
-    if (error) {
-      // Pode já existir — tenta update
-      if (error.code === "23505" || error.message?.includes("duplicate")) {
+    // ── UPSERT: se já existir registro deste usuário, atualiza; senão, insere.
+    //    Requer UNIQUE em contratos_aceites.usuario_id (ver migration SQL abaixo). ──
+    let { error } = await supa
+      .from("contratos_aceites")
+      .upsert([payload], { onConflict: "usuario_id" });
+
+    // ── Fallback defensivo: se a UNIQUE constraint não existir ainda,
+    //    cai para o fluxo antigo (UPDATE → INSERT). ──
+    if (error && /no unique|there is no unique|onConflict/i.test(error.message || "")) {
+      const { data: existing } = await supa
+        .from("contratos_aceites")
+        .select("id")
+        .eq("usuario_id", session.user.id)
+        .limit(1);
+
+      if (existing && existing.length > 0) {
         await supa
           .from("contratos_aceites")
-          .update({
-            aceito: true,
-            nome_assinante: nome,
-            doc_assinante: doc,
-            aceito_em: new Date().toISOString(),
-          })
+          .update(payload)
           .eq("usuario_id", session.user.id);
       } else {
-        throw error;
+        await supa.from("contratos_aceites").insert([payload]);
       }
+      error = null;
     }
+
+    if (error) throw error;
 
     const overlay = document.getElementById("contrato-admin-overlay");
     if (overlay) overlay.style.display = "none";
-    console.log("✅ Contrato aceito com sucesso.");
+    console.log("✅ Contrato aceito com sucesso para usuário", session.user.id);
   } catch (e) {
     alert("Erro ao registrar assinatura: " + e.message);
     if (btn) {
@@ -16497,6 +16535,7 @@ async function admAceitarContrato() {
     }
   }
 }
+
 // ══════════════════════════════════════════════════════════════
 //  VAREJO — Adições ao admin.js
 //  Cole este bloco no final do seu admin.js existente.
