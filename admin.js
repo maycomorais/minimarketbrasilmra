@@ -15991,21 +15991,45 @@ let _obStep = 0;
 let _obData = {};
 
 async function iniciarOnboarding() {
-  // Só mostra se o banco não tiver nome configurado ainda
-  try {
-    const { data } = await supa
-      .from("configuracoes")
-      .select("nome_restaurante")
-      .maybeSingle();
-    if (data?.nome_restaurante) return; // já configurado
-  } catch (_) {
-    return;
-  }
+  // ── 1. Flag local por usuário: se já foi mostrado/concluído neste
+  //        navegador para este usuário, não verifica nem abre de novo. ──
+  const _obKey = `onboarding_done_${_perfilId || "anon"}`;
+  if (localStorage.getItem(_obKey) === "1") return;
 
-  _obStep = 0;
-  _obData = {};
-  _obRender();
-  document.getElementById("modal-onboarding").style.display = "flex";
+  try {
+    const { data, error } = await supa
+      .from("configuracoes")
+      .select("nome_restaurante, logo_url, icone_url, whatsapp_loja, coord_lat, coord_lng")
+      .maybeSingle();
+
+    if (error) {
+      // Fail-open: erro de rede/RLS não abre o onboarding nem quebra o painel
+      console.warn("[onboarding] Erro ao verificar config:", error.message);
+      return;
+    }
+
+    // ── 2. Verifica se o banco JÁ tem dados de identidade.
+    //    Um nome só com espaços ou vazio NÃO conta como configurado. ──
+    const nomeOk   = (data?.nome_restaurante || "").trim().length > 0;
+    const logoOk   = (data?.logo_url || data?.icone_url || "").trim().length > 0;
+    const whatsOk  = (data?.whatsapp_loja || "").trim().length > 0;
+    const coordOk  = !!(data?.coord_lat && data?.coord_lng);
+
+    if (nomeOk || logoOk || whatsOk || coordOk) {
+      // Já está configurado → marca a flag e nunca mais verifica
+      localStorage.setItem(_obKey, "1");
+      return;
+    }
+
+    // ── 3. Sem dados de identidade → mostra onboarding (primeira vez). ──
+    _obStep = 0;
+    _obData = {};
+    _obRender();
+    document.getElementById("modal-onboarding").style.display = "flex";
+  } catch (e) {
+    // Qualquer exceção → fail-open, não abre onboarding por engano
+    console.warn("[onboarding] Erro inesperado:", e.message);
+  }
 }
 
 function _obRender() {
@@ -16135,6 +16159,11 @@ function _obSkip() {
     )
   )
     return;
+
+  // Marca como "já mostrado" — nunca mais abre neste navegador para este usuário
+  const _obKey = `onboarding_done_${_perfilId || "anon"}`;
+  localStorage.setItem(_obKey, "1");
+
   document.getElementById("modal-onboarding").style.display = "none";
 }
 
@@ -16176,6 +16205,10 @@ async function _obSalvar() {
         "--primary",
         payload.cor_primaria,
       );
+
+    // ── Marca como concluído — nunca mais abre para este usuário. ──
+    const _obKey = `onboarding_done_${_perfilId || "anon"}`;
+    localStorage.setItem(_obKey, "1");
 
     document.getElementById("modal-onboarding").style.display = "none";
 
