@@ -5270,8 +5270,8 @@ function ptAplicarFiltros() {
     const hoje = new Date();
     hoje.setHours(0, 0, 0, 0);
     lista = lista.filter((p) => {
-      if (!p.validade) return false;
-      const d = new Date(p.validade + "T00:00:00");
+      if (!p.data_validade) return false;
+      const d = new Date(p.data_validade + "T00:00:00");
       const diff = Math.round((d - hoje) / 86400000);
       if (validade === "vencido") return diff < 0;
       if (validade === "proximo") return diff >= 0 && diff <= 3;
@@ -5500,8 +5500,8 @@ function renderizarCardsProdutos(lista) {
 
     // ── Validade ─────────────────────────────────────────────
     let validadeHtml = `<span style="color:#cbd5e1">—</span>`;
-    if (p.validade) {
-      const d = new Date(p.validade + "T00:00:00");
+    if (p.data_validade) {
+      const d = new Date(p.data_validade + "T00:00:00");
       const hoje = new Date();
       hoje.setHours(0, 0, 0, 0);
       const diff = Math.round((d - hoje) / 86400000);
@@ -10675,42 +10675,79 @@ function _pdvMostrarToast(msg, cor, duracao) {
 }
 
 function adicionarItemPDV(p) {
-  // ⚠️ Revalidação silenciosa de estoque: consulta o banco em background
-  // e, se o produto esgotou, avisa o operador sem bloquear o fluxo.
-  if (!p._isExtra && p.id && !p._isKg) {
-    supa
-      .from("produtos")
-      .select("estoque_qtd, ativo")
-      .eq("id", p.id)
-      .single()
-      .then(({ data: fresh }) => {
-        if (!fresh) return;
-        if (fresh.ativo === false) {
-          _pdvMostrarToast(
-            `⚠️ "${p.nome}" está pausado no cadastro.`,
-            "#f59e0b",
-            3500,
-          );
-        } else if (
-          fresh.estoque_qtd !== null &&
-          fresh.estoque_qtd !== undefined &&
-          fresh.estoque_qtd <= 0
-        ) {
-          _pdvMostrarToast(
-            `⚠️ "${p.nome}" acabou de esgotar — verifique estoque físico.`,
-            "#dc2626",
-            4000,
-          );
-        }
-        // Atualiza cache local pra próxima renderização
-        const cached = produtosCachePDV.find((x) => x.id === p.id);
-        if (cached) {
-          cached.estoque_qtd = fresh.estoque_qtd;
-          cached.ativo = fresh.ativo;
-        }
-      })
-      .catch(() => {});
-}
+  // montagem_config pode chegar como string JSON de bancos antigos
+  let cfg = p.montagem_config;
+  if (typeof cfg === "string") {
+    try {
+      cfg = JSON.parse(cfg);
+    } catch (_) {
+      cfg = null;
+    }
+  }
+  const tipo = cfg && !Array.isArray(cfg) && cfg.__tipo ? cfg.__tipo : null;
+
+  // Kg → modal de peso/balança
+  if (tipo === "kg") {
+    _mostrarModalPesoPDV(p, cfg.preco_kg || p.preco || 0);
+    return;
+  }
+
+  // Tipos com seleção obrigatória → abre modal de opções
+  if (tipo === "variacoes" && cfg.variacoes?.length > 0) {
+    const ativas = cfg.variacoes.filter((v) => v.ativo !== false);
+    if (!ativas.length) {
+      alert("⏸️ Todas as variações estão pausadas.");
+      return;
+    }
+    _mostrarModalOpcoesPDV(p, "variacoes");
+    return;
+  }
+  if (tipo === "pizza") {
+    _mostrarModalOpcoesPDV(p, "pizza");
+    return;
+  }
+  if (tipo === "acai") {
+    _mostrarModalOpcoesPDV(p, "acai");
+    return;
+  }
+  if (tipo === "shake") {
+    _mostrarModalOpcoesPDV(p, "shake");
+    return;
+  }
+  if (tipo === "suco") {
+    _mostrarModalOpcoesPDV(p, "suco");
+    return;
+  }
+  if (tipo === "sorvete") {
+    _mostrarModalOpcoesPDV(p, "sorvete");
+    return;
+  }
+  if (tipo === "montavel" && cfg.etapas?.length > 0) {
+    _mostrarModalOpcoesPDV(p, "montavel");
+    return;
+  }
+
+    // Simples / Lanche / Bebida / Combo — adiciona direto
+    // Aplica o multiplicador atual (botões +5/+10 ou prefixo "10+")
+    const mult = Math.max(1, parseInt(window._pdvQtyMultiplier || 1, 10));
+    const existe = carrinhoPDV.find((i) => i.id === p.id && !i.variacao);
+    if (existe) existe.qtd += mult;
+    else carrinhoPDV.push({
+      ...p,
+      qtd: mult,
+      montagem: [],
+      obs: "",
+      _extrasSoma: 0,
+    });
+    // Reseta multiplicador após adicionar
+    pdvSetQtyMultiplier(1);
+    atualizarCarrinhoPDV();
+
+  if (_deveMostrarExtrasGlobais(p)) {
+    _getExtrasGlobais().then((extras) => {
+      if (extras?.length > 0) _mostrarUpsellExtrasPDV(p, extras);
+    });
+  }
 }
 
 // ── Modal unificado de opções para PDV ────────────────────────────
