@@ -3297,41 +3297,56 @@ function _coletarMultiPagamento() {
 }
 
 async function calcularFrete() {
-  const btn = document.getElementById("btn-gps");
-  const msg = document.getElementById("frete-msg");
+  const btn     = document.getElementById("btn-gps");
+  const msg     = document.getElementById("frete-msg");
   const boxErro = document.getElementById("box-erro-gps");
 
-  // ── Guard: elementos essenciais existem? ────────────────────────
+  // ── Guard 0: elementos essenciais existem? ────────────────────────
   if (!btn || !msg || !boxErro) {
-    console.warn("[calcularFrete] Elementos do DOM não encontrados");
+    console.warn("[calcularFrete] ❌ Elementos do DOM não encontrados",
+      { btn: !!btn, msg: !!msg, boxErro: !!boxErro });
     return;
   }
 
-  // ── Reseta estado visual ────────────────────────────────────────
-  btn.innerText = "⏳ Localizando...";
-  btn.disabled = true;
+  // ── Log de diagnóstico ────────────────────────────────────────────
+  console.log("[calcularFrete] 🔵 Clique recebido");
+  console.log("[calcularFrete] COORD_LOJA =", COORD_LOJA);
+  console.log("[calcularFrete] TABELA_FRETE =", TABELA_FRETE);
+  console.log("[calcularFrete] protocol =", location.protocol);
+  console.log("[calcularFrete] geolocation support =", !!navigator.geolocation);
+
+  // ── Estado de loading ────────────────────────────────────────────
+  btn.innerText   = "⏳ Localizando...";
+  btn.disabled    = true;
   msg.style.color = "";
-  msg.innerHTML =
-    '<span style="color:#888">⏳ Obtendo sua localização...</span>';
+  msg.innerHTML   = '<span style="color:#888">⏳ Obtendo sua localização...</span>';
   boxErro.style.display = "none";
 
-  // ── Guard: loja precisa ter coordenadas configuradas ────────────
-  if (!COORD_LOJA.lat || !COORD_LOJA.lng) {
-    msg.innerHTML =
-      '<span style="color:#e74c3c">⚠️ Loja sem coordenadas configuradas. Contate o suporte.</span>';
-    btn.innerText = "📍 Calcular Envio";
-    btn.disabled = false;
+  // Helper para restaurar o botão em qualquer caminho de saída
+  const _restaurarBotao = (texto = "📍 Calcular Envio") => {
+    btn.innerText = texto;
+    btn.disabled  = false;
+  };
+
+  // ── Guard 1: loja precisa ter coordenadas configuradas ────────────
+  const _temCoordLoja =
+    Number.isFinite(COORD_LOJA?.lat) && Number.isFinite(COORD_LOJA?.lng) &&
+    (COORD_LOJA.lat !== 0 || COORD_LOJA.lng !== 0);
+
+  if (!_temCoordLoja) {
+    msg.innerHTML = '<span style="color:#e74c3c">⚠️ Loja sem coordenadas configuradas. Contate o suporte.</span>';
+    _restaurarBotao();
     return;
   }
 
-  // ── Guard: HTTPS obrigatório para Geolocation API ───────────────
+  // ── Guard 2: HTTPS obrigatório para Geolocation API ───────────────
   const _protocoloSeguro =
     location.protocol === "https:" ||
     location.hostname === "localhost" ||
     location.hostname === "127.0.0.1";
+
   if (!_protocoloSeguro) {
-    msg.innerHTML =
-      '<span style="color:#e74c3c">⚠️ GPS requer HTTPS. Acesse o site via <code>https://</code></span>';
+    msg.innerHTML = '<span style="color:#e74c3c">⚠️ GPS requer HTTPS. Acesse o site via <code>https://</code></span>';
     boxErro.innerHTML = `
       <p><strong><i class="fas fa-info-circle"></i> Sem HTTPS o GPS não funciona</strong></p>
       <p style="margin-top:6px">Você pode aplicar a <strong>taxa padrão de entrega</strong> ou combinar o valor pelo WhatsApp.</p>
@@ -3340,25 +3355,22 @@ async function calcularFrete() {
         <span>Aplicar taxa padrão de entrega</span>
       </label>`;
     boxErro.style.display = "block";
-    btn.innerText = "📍 Calcular Envio";
-    btn.disabled = false;
+    _restaurarBotao();
     return;
   }
 
-  // ── Guard: API de geolocalização disponível? ────────────────────
+  // ── Guard 3: API de geolocalização disponível? ────────────────────
   if (!navigator.geolocation) {
-    msg.innerHTML =
-      '<span style="color:#e74c3c">GPS não disponível neste dispositivo.</span>';
-    btn.innerText = "📍 Calcular Envio";
-    btn.disabled = false;
+    msg.innerHTML = '<span style="color:#e74c3c">GPS não disponível neste dispositivo.</span>';
+    _restaurarBotao();
     return;
   }
 
-  // ────────────────────────────────────────────────────────────────
-  //  WATCHDOG: se nenhum callback disparar em 15s, destrava o botão.
+  // ═══════════════════════════════════════════════════════════════
+  //  WATCHDOG — se nenhum callback disparar em 15s, destrava o botão.
   //  O timeout nativo do browser NÃO é confiável em iOS Safari com
   //  permissão pendente — este é o backup que garante destravamento.
-  // ────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════
   let _gpsFinalizado = false;
 
   const _mostrarFallbackManual = (titulo, texto) => {
@@ -3370,29 +3382,25 @@ async function calcularFrete() {
         <span>Aplicar taxa padrão de entrega</span>
       </label>`;
     boxErro.style.display = "block";
-    btn.innerText = "📍 Tentar Novamente";
-    btn.disabled = false;
+    _restaurarBotao("📍 Tentar Novamente");
   };
 
   const _watchdog = setTimeout(() => {
     if (_gpsFinalizado) return;
     _gpsFinalizado = true;
-    console.warn(
-      "[calcularFrete] Watchdog disparou — geolocation não respondeu em 15s",
-    );
-    msg.innerHTML =
-      '<span style="color:#e74c3c">⚠️ GPS não respondeu. Verifique se a localização está ativa no navegador.</span>';
+    console.warn("[calcularFrete] ⏰ Watchdog disparou — geolocation não respondeu em 15s");
+    msg.innerHTML = '<span style="color:#e74c3c">⚠️ GPS não respondeu. Verifique se a localização está ativa no navegador.</span>';
     _mostrarFallbackManual(
       "GPS não respondeu?",
-      "Isso pode acontecer se você negou a permissão ou se a localização está desativada no dispositivo.",
+      "Isso pode acontecer se você negou a permissão ou se a localização está desativada no dispositivo."
     );
   }, 15000);
 
-  // ────────────────────────────────────────────────────────────────
-  //  Obtém posição do cliente
-  // ────────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════
+  //  Solicita posição do cliente
+  // ═══════════════════════════════════════════════════════════════
   navigator.geolocation.getCurrentPosition(
-    // ── Callback de sucesso ──────────────────────────────────────
+    // ── Sucesso ──────────────────────────────────────────────────
     async (position) => {
       if (_gpsFinalizado) return;
       _gpsFinalizado = true;
@@ -3403,20 +3411,21 @@ async function calcularFrete() {
         lng: position.coords.longitude,
       };
 
-      msg.style.color = "";
-      msg.innerHTML =
-        '<span style="color:#888">⏳ Calculando rota real...</span>';
+      console.log("[calcularFrete] 📍 Cliente em:", localCliente);
 
-      // ── Calcula distância pela ROTA REAL via OSRM ──────────────
+      msg.style.color = "";
+      msg.innerHTML   = '<span style="color:#888">⏳ Calculando rota real...</span>';
+
+      // ── Chama OSRM com timeout interno ─────────────────────────
       let dist = null;
       try {
         dist = await obterDistanciaPelaRota(
-          COORD_LOJA.lat,
-          COORD_LOJA.lng,
-          localCliente.lat,
-          localCliente.lng,
+          COORD_LOJA.lat, COORD_LOJA.lng,
+          localCliente.lat, localCliente.lng
         );
-      } catch (_e) {
+        console.log("[calcularFrete] 📏 Distância OSRM:", dist, "km");
+      } catch (e) {
+        console.warn("[calcularFrete] OSRM falhou:", e.message);
         dist = null;
       }
 
@@ -3424,8 +3433,8 @@ async function calcularFrete() {
       if (dist === null || !Number.isFinite(dist) || dist <= 0) {
         const r = calcularFreteSemLocalizacao(TABELA_FRETE);
         freteCalculado = r.loja;
-        freteMotoboy = r.motoboy;
-        freteSemGPS = true;
+        freteMotoboy   = r.motoboy;
+        freteSemGPS    = true;
         freteACombinar = r.acombinar === true;
 
         if (freteACombinar) {
@@ -3434,13 +3443,13 @@ async function calcularFrete() {
           msg.innerHTML = `<span style="color:#e67e22">⚠️ Rota indisponível. Aplicada taxa padrão: Gs ${r.loja.toLocaleString("es-PY")}</span>`;
         }
       }
-      // ── OSRM OK → aplicar faixa real (ou "a combinar") ────────
+      // ── OSRM OK → aplica faixa real (ou "a combinar") ──────────
       else {
         const r = calcularFretePorDistancia(dist, TABELA_FRETE);
         freteCalculado = r.loja;
-        freteMotoboy = r.motoboy;
+        freteMotoboy   = r.motoboy;
         freteACombinar = r.acombinar === true;
-        freteSemGPS = false;
+        freteSemGPS    = false;
 
         if (freteACombinar) {
           msg.innerHTML = `<span style="color:#e67e22">✅ Rota: ${dist.toFixed(1)}km — Frete <strong>a combinar</strong></span>`;
@@ -3450,32 +3459,33 @@ async function calcularFrete() {
       }
 
       boxErro.style.display = "none";
-      btn.innerText = "✅ Localização OK";
-      btn.disabled = true;
+      btn.innerText         = "✅ Localização OK";
+      btn.disabled          = true;
       atualizarTotalCheckout();
     },
 
-    // ── Callback de erro ─────────────────────────────────────────
+    // ── Erro ─────────────────────────────────────────────────────
     (err) => {
       if (_gpsFinalizado) return;
       _gpsFinalizado = true;
       clearTimeout(_watchdog);
 
+      console.warn("[calcularFrete] ❌ Erro geolocation:", err.code, err.message);
+
       let errMsg = "Não foi possível obter sua localização.";
-      if (err.code === 1) errMsg = "⚠️ Permissão de GPS negada.";
-      else if (err.code === 2)
-        errMsg = "⚠️ Localização indisponível. Verifique se o GPS está ativo.";
+      if (err.code === 1)      errMsg = "⚠️ Permissão de GPS negada.";
+      else if (err.code === 2) errMsg = "⚠️ Localização indisponível. Verifique se o GPS está ativo.";
       else if (err.code === 3) errMsg = "⚠️ Tempo esgotado ao obter localização.";
 
       msg.innerHTML = `<span style="color:#e74c3c">${errMsg}</span>`;
       _mostrarFallbackManual(
         "GPS não funcionou?",
-        "Você pode aplicar a <strong>taxa padrão de entrega</strong> (equivalente a 2–3 km) e prosseguir.",
+        "Você pode aplicar a <strong>taxa padrão de entrega</strong> (equivalente a 2–3 km) e prosseguir."
       );
     },
 
-    // ── Opções ────────────────────────────────────────────────────
-    { timeout: 10000, maximumAge: 60000, enableHighAccuracy: true },
+    // ── Opções ───────────────────────────────────────────────────
+    { timeout: 10000, maximumAge: 60000, enableHighAccuracy: true }
   );
 }
 

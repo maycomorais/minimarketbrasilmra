@@ -1369,12 +1369,29 @@ async function mudarStatus(id, novoStatus) {
     return;
   }
 
-  if (novoStatus === "em_preparo") {
-    const _resDesc = await _descontarEstoqueVenda(id, null);
-    // 🔧 Só marca como descontado se de fato confirmou sucesso — do
-    // contrário mascara a falha e nada mais tenta descontar depois.
-    await supa.from("pedidos").update({ estoque_descontado: _resDesc.ok }).eq("id", id);
-    await _alertarFalhaEstoque(_resDesc, `Pedido #${id} → Separação`);
+    if (novoStatus === "em_preparo") {
+    // ⚠️ GUARD anti-duplo-desconto:
+    // Se o pedido JÁ teve estoque descontado (ex: veio do PDV balcão com
+    // `estoque_descontado = true`, ou um operador já clicou em Preparar
+    // antes), não desconta de novo.
+    const { data: _pedCheck } = await supa
+      .from("pedidos")
+      .select("estoque_descontado")
+      .eq("id", id)
+      .single();
+
+    if (_pedCheck?.estoque_descontado) {
+      console.log(
+        `[Estoque] Pedido #${id} já teve estoque descontado — pulando.`,
+      );
+    } else {
+      const _resDesc = await _descontarEstoqueVenda(id, null);
+      await supa
+        .from("pedidos")
+        .update({ estoque_descontado: _resDesc.ok })
+        .eq("id", id);
+      await _alertarFalhaEstoque(_resDesc, `Pedido #${id} → Separação`);
+    }
   }
 
   // Bug #7 corrigido: repõe estoque ao cancelar — SOMENTE se já tinha
@@ -3403,13 +3420,19 @@ async function salvarMovimentacaoCaixa() {
 
 /**
  * Recalcula o resumo de uma sessão de caixa direto do banco.
- * Ignora _caixaState, filtros de tela e qualquer variável JS.
- * Chama a view vw_sessao_resumo como fonte da verdade.
  *
- * @param {number} sessaoId
- * @param {string} inicioISO   — aberto_em da sessão (ISO com TZ)
- * @param {string} fimISO      — fechado_em (ISO com TZ) ou NOW
- * @returns {Promise<object>}  resumo completo
+ * ⚠️ CORREÇÕES CRÍTICAS:
+ *
+ * 1. FATURAMENTO = SUM(subtotal - descontos) — NÃO inclui frete.
+ *    O frete é repasse ao motoboy, não receita da loja.
+ *
+ * 2. CUSTO_ENTREGAS: se o operador registrou pagamentos aos motoboys
+ *    (despesas com tipo_despesa='motoboy'), usamos o VALOR REAL pago.
+ *    Caso contrário, caímos no auto-calculado (soma de frete_motoboy).
+ *    Isso evita contagem dupla quando ambos existem.
+ *
+ * 3. DINHEIRO_GAVETA: apenas motoboy pago em EFECTIVO reduz a gaveta.
+ *    Pix/Transferência/Cartão não passam pela gaveta.
  */
 async function _calcularResumoSessao(sessaoId, inicioISO, fimISO) {
   const safeNum = (v) => {
@@ -3420,101 +3443,127 @@ async function _calcularResumoSessao(sessaoId, inicioISO, fimISO) {
     );
   };
 
-  // ── 1. Consulta a view de resumo (fonte autoritativa, cálculo em SQL) ──
-  const { data: rows, error } = await supa
-    .from("vw_sessao_resumo")
-    .select("*")
-    .eq("sessao_id", sessaoId)
-    .limit(1);
+  // ── 1. Busca em paralelo ────────────────────────────────────────
+  const [
+    { data: rows, error },
+    { data: pedidosBrutos },
+    { data: movs },
+  ] = await Promise.all([
+    supa.from("vw_sessao_resumo").select("*").eq("sessao_id", sessaoId).limit(1),
+    supa
+      .from("pedidos")
+      .select(
+        "subtotal, total_geral, frete_cobrado_cliente, frete_motoboy, " +
+        "desconto_cupom, desconto_pdv_valor, cashback_valor, " +
+        "forma_pagamento, tipo_entrega, motoboy_id, motoboys(nome)",
+      )
+      .neq("status", "cancelado")
+      .gte("created_at", inicioISO)
+      .lte("created_at", fimISO),
+    supa
+      .from("movimentacoes_caixa")
+      .select("tipo, valor, tipo_despesa, descricao_outro")
+      .eq("sessao_id", sessaoId),
+  ]);
 
-  if (!error && rows && rows.length > 0) {
-    const r = rows[0];
-    const faturamento    = safeNum(r.faturamento);
-    const custoEntregas  = safeNum(r.custo_entregas);
-    const totalDespesas  = safeNum(r.total_despesas);
-    const totalSangrias  = safeNum(r.total_sangrias);
-    const totalSuprimentos = safeNum(r.total_suprimentos);
-    const totalSaidas    = totalDespesas + totalSangrias;
-    const totalEfetivo   = safeNum(r.total_efetivo);
-    const valorAbertura  = safeNum(r.valor_abertura);
-    const lucroOperacional =
-      faturamento + totalSuprimentos - custoEntregas - totalSaidas;
-    const dinheiroGaveta = valorAbertura + totalSuprimentos + totalEfetivo - totalSaidas;
+  const peds = pedidosBrutos || [];
+  const movsArr = movs || [];
 
-    // Custo de combustível dos motoboys únicos nessa janela
-    let custoCombustivel = 0;
-    const motoMap = {};
-    try {
-      const { data: peds } = await supa
-        .from("pedidos")
-        .select("motoboy_id, motoboys(nome)")
-        .neq("status", "cancelado")
-        .eq("tipo_entrega", "delivery")
-        .gte("created_at", inicioISO)
-        .lte("created_at", fimISO);
-      (peds || []).forEach((p) => {
-        const nm = p.motoboys?.nome || "Sem Motoboy";
-        if (!motoMap[nm]) motoMap[nm] = true;
-      });
-      delete motoMap["Sem Motoboy"];
-      custoCombustivel = (AJUDA_COMBUSTIVEL || 0) * Object.keys(motoMap).length;
-    } catch (_) {
-      custoCombustivel = 0;
+  // ═══════════════════════════════════════════════════════════════
+  //  🔧 CORREÇÃO CRÍTICA #1 — Faturamento = total_geral (inclui frete)
+  //
+  //  Antes: faturamentoReal = subtotal − descontos (SEM frete)
+  //         → frete entrava na gaveta mas não era receita,
+  //           porém o pagamento ao motoboy era subtraído como despesa,
+  //           gerando diferença = soma dos fretes.
+  //
+  //  Agora:  faturamentoReal = total_geral (inclui frete).
+  //          O repasse ao motoboy é despesa real → desconta do lucro.
+  //          Resultado: cliente paga Gs X (produto) + Gs Y (frete);
+  //          loja paga Gs Y ao motoboy; lucro = X + Y − Y = X. ✓
+  // ═══════════════════════════════════════════════════════════════
+  let faturamentoReal   = 0;
+  let freteCobradoTotal = 0;
+  let freteEmEspecie    = 0;
+  let freteMotoboyAuto  = 0;
+  let descontoTotal     = 0;
+  const motoMap = {};
+
+  peds.forEach((p) => {
+    const sub = safeNum(p.subtotal);
+    const dc  = safeNum(p.desconto_cupom);
+    const dp  = safeNum(p.desconto_pdv_valor);
+    const cb  = safeNum(p.cashback_valor);
+    const freteVal = safeNum(p.frete_cobrado_cliente);
+
+    descontoTotal     += dc + dp + cb;
+    freteCobradoTotal += freteVal;
+
+    // Faturamento = subtotal − descontos + frete cobrado
+    faturamentoReal += Math.max(0, sub - dc - dp - cb) + freteVal;
+
+    if (p.tipo_entrega === "delivery") {
+      freteMotoboyAuto += safeNum(p.frete_motoboy);
+      const nm = p.motoboys?.nome || "Sem Motoboy";
+      if (!motoMap[nm]) motoMap[nm] = true;
+
+      const forma = (p.forma_pagamento || "").toLowerCase();
+      if (forma.includes("efetivo") || forma.includes("dinheiro")) {
+        freteEmEspecie += freteVal;
+      }
     }
+  });
+  delete motoMap["Sem Motoboy"];
+  const custoCombustivel = (AJUDA_COMBUSTIVEL || 0) * Object.keys(motoMap).length;
 
-    return {
-      sessao_id:         r.sessao_id,
-      usuario_email:     r.usuario_email,
-      usuario_nome:      r.usuario_nome,
-      aberto_em:         r.aberto_em,
-      fechado_em:        r.fechado_em,
-      valor_abertura:    valorAbertura,
+  // ── 3. Separa despesas motoboy vs. outras ──────────────────────
+  let motoboyTotal     = 0;
+  let motoboyEfetivo   = 0;
+  let outrasDespesas   = 0;
+  let totalSangrias    = 0;
+  let totalSuprimentos = 0;
 
-      faturamento,
-      qtd_pedidos:       safeNum(r.qtd_pedidos),
-      custo_entregas:    custoEntregas + custoCombustivel,
-      custo_combustivel: custoCombustivel,
-      total_despesas:    totalDespesas,
-      total_sangrias:    totalSangrias,
-      total_suprimentos: totalSuprimentos,
-      total_saidas:      totalSaidas,
-      total_entradas:    totalSuprimentos,
-      lucro_operacional: lucroOperacional,
-      dinheiro_gaveta:   dinheiroGaveta,
+  movsArr.forEach((m) => {
+    const v = safeNum(m.valor);
+    if (m.tipo === "despesa") {
+      if (m.tipo_despesa === "motoboy") {
+        motoboyTotal += v;
+        const forma = (m.descricao_outro || "").toLowerCase();
+        if (forma.includes("efetivo") || forma.includes("dinheiro")) {
+          motoboyEfetivo += v;
+        }
+      } else {
+        outrasDespesas += v;
+      }
+    }
+    if (m.tipo === "sangria") totalSangrias += v;
+    if (m.tipo === "suprimento" || m.tipo === "abertura") totalSuprimentos += v;
+  });
 
-      total_efetivo:      totalEfetivo,
-      total_pix:          safeNum(r.total_pix),
-      total_cartao:       safeNum(r.total_cartao),
-      total_cartao_br:    safeNum(r.total_cartao_br),
-      total_transferencia:safeNum(r.total_transferencia),
-      total_qr_py:        safeNum(r.total_qr_py),
-      total_multi_outros: safeNum(r.total_multi_outros),
-    };
+  // ── 4. Custo de entregas real ──────────────────────────────────
+  let custoEntregas;
+  if (motoboyTotal > 0) {
+    custoEntregas = motoboyTotal + custoCombustivel;
+  } else {
+    custoEntregas = freteMotoboyAuto + custoCombustivel;
   }
 
-  // ── 2. Fallback: se a view não existir (deploy sem rodar o SQL) ──
-  //     Recalcula em JS direto dos pedidos + movimentações.
-  console.warn(
-    "[_calcularResumoSessao] View vw_sessao_resumo indisponível — usando cálculo em JS.",
-  );
+  const totalDespesas = motoboyTotal + outrasDespesas;
+  const totalSaidas   = totalDespesas + totalSangrias;
+  const lucroOperacional = faturamentoReal + totalSuprimentos - totalSaidas;
 
-  const { data: pedidos } = await supa
-    .from("pedidos")
-    .select("total_geral, frete_motoboy, forma_pagamento, tipo_entrega")
-    .neq("status", "cancelado")
-    .gte("created_at", inicioISO)
-    .lte("created_at", fimISO);
-
-  const peds = pedidos || [];
-  let faturamento = 0, custoEntregas = 0;
+  // ── 5. Totais por forma de pagamento (incluindo frete) ─────────
   let totalEfetivo = 0, totalPix = 0, totalCartao = 0;
   let totalCartaoBR = 0, totalTransf = 0, totalQrPy = 0, totalMulti = 0;
 
   peds.forEach((p) => {
-    const val = safeNum(p.total_geral);
-    faturamento += val;
-    if (p.tipo_entrega === "delivery")
-      custoEntregas += safeNum(p.frete_motoboy);
+    const base = Math.max(
+      0,
+      safeNum(p.subtotal) - safeNum(p.desconto_cupom) -
+      safeNum(p.desconto_pdv_valor) - safeNum(p.cashback_valor),
+    );
+    // 🔧 Inclui frete no valor que efetivamente passou por cada meio de pagamento
+    const val = base + safeNum(p.frete_cobrado_cliente);
     const pag = (p.forma_pagamento || "").toLowerCase();
     if (pag.includes("efetivo") || pag.includes("dinheiro")) totalEfetivo += val;
     else if (pag.includes("pix")) totalPix += val;
@@ -3525,48 +3574,343 @@ async function _calcularResumoSessao(sessaoId, inicioISO, fimISO) {
     else totalMulti += val;
   });
 
-  const { data: movs } = await supa
-    .from("movimentacoes_caixa")
-    .select("tipo, valor")
-    .eq("sessao_id", sessaoId);
+  // ── 6. Dinheiro na gaveta ──────────────────────────────────────
+  const saidasEfetivo =
+    motoboyTotal > 0
+      ? motoboyEfetivo + outrasDespesas + totalSangrias
+      : freteEmEspecie + outrasDespesas + totalSangrias;
 
-  let totalDespesas = 0, totalSangrias = 0, totalSuprimentos = 0;
-  (movs || []).forEach((m) => {
-    const v = safeNum(m.valor);
-    if (m.tipo === "despesa") totalDespesas += v;
-    if (m.tipo === "sangria") totalSangrias += v;
-    if (m.tipo === "suprimento" || m.tipo === "abertura")
-      totalSuprimentos += v;
-  });
+  const valorAbertura = safeNum(_sessaoCaixaAtiva?.valor_abertura) ||
+                        (rows?.[0] ? safeNum(rows[0].valor_abertura) : 0);
 
-  const totalSaidas = totalDespesas + totalSangrias;
-  const lucroOperacional =
-    faturamento + totalSuprimentos - custoEntregas - totalSaidas;
+  const dinheiroGaveta =
+    valorAbertura + totalSuprimentos + totalEfetivo - saidasEfetivo;
+
+  // ── 7. Retorno ──────────────────────────────────────────────────
+  if (!error && rows && rows.length > 0) {
+    const r = rows[0];
+    return {
+      sessao_id:         r.sessao_id,
+      usuario_email:     r.usuario_email,
+      usuario_nome:      r.usuario_nome,
+      aberto_em:         r.aberto_em,
+      fechado_em:        r.fechado_em,
+      valor_abertura:    valorAbertura,
+
+      faturamento:       faturamentoReal,
+      frete_cobrado:     freteCobradoTotal,
+      frete_em_especie:  freteEmEspecie,
+      desconto_total:    descontoTotal,
+      qtd_pedidos:       safeNum(r.qtd_pedidos) || peds.length,
+
+      custo_entregas:    custoEntregas,
+      custo_combustivel: custoCombustivel,
+      motoboy_total:     motoboyTotal,
+      motoboy_efetivo:   motoboyEfetivo,
+      outras_despesas:   outrasDespesas,
+
+      total_despesas:    totalDespesas,
+      total_sangrias:    totalSangrias,
+      total_suprimentos: totalSuprimentos,
+      total_saidas:      totalSaidas,
+      total_entradas:    totalSuprimentos,
+
+      lucro_operacional: lucroOperacional,
+      dinheiro_gaveta:   dinheiroGaveta,
+
+      total_efetivo:       totalEfetivo,
+      total_pix:           totalPix,
+      total_cartao:        totalCartao,
+      total_cartao_br:     totalCartaoBR,
+      total_transferencia: totalTransf,
+      total_qr_py:         totalQrPy,
+      total_multi_outros:  totalMulti,
+    };
+  }
 
   return {
-    sessao_id: sessaoId,
-    aberto_em: inicioISO,
-    fechado_em: fimISO,
-    valor_abertura: 0,
-    faturamento,
-    qtd_pedidos: peds.length,
-    custo_entregas: custoEntregas,
-    custo_combustivel: 0,
-    total_despesas: totalDespesas,
-    total_sangrias: totalSangrias,
-    total_suprimentos: totalSuprimentos,
-    total_saidas: totalSaidas,
-    total_entradas: totalSuprimentos,
-    lucro_operacional: lucroOperacional,
-    dinheiro_gaveta: totalSuprimentos + totalEfetivo - totalSaidas,
-    total_efetivo: totalEfetivo,
-    total_pix: totalPix,
-    total_cartao: totalCartao,
-    total_cartao_br: totalCartaoBR,
+    sessao_id:           sessaoId,
+    aberto_em:           inicioISO,
+    fechado_em:          fimISO,
+    valor_abertura:      valorAbertura,
+    faturamento:         faturamentoReal,
+    frete_cobrado:       freteCobradoTotal,
+    frete_em_especie:    freteEmEspecie,
+    desconto_total:      descontoTotal,
+    qtd_pedidos:         peds.length,
+    custo_entregas:      custoEntregas,
+    custo_combustivel:   custoCombustivel,
+    motoboy_total:       motoboyTotal,
+    motoboy_efetivo:     motoboyEfetivo,
+    outras_despesas:     outrasDespesas,
+    total_despesas:      totalDespesas,
+    total_sangrias:      totalSangrias,
+    total_suprimentos:   totalSuprimentos,
+    total_saidas:        totalSaidas,
+    total_entradas:      totalSuprimentos,
+    lucro_operacional:   lucroOperacional,
+    dinheiro_gaveta:     dinheiroGaveta,
+    total_efetivo:       totalEfetivo,
+    total_pix:           totalPix,
+    total_cartao:        totalCartao,
+    total_cartao_br:     totalCartaoBR,
     total_transferencia: totalTransf,
-    total_qr_py: totalQrPy,
-    total_multi_outros: totalMulti,
+    total_qr_py:         totalQrPy,
+    total_multi_outros:  totalMulti,
   };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PAGAMENTO AOS MOTOBOYS — registro de despesas no fechamento
+//  Chama antes de fecharCaixaResumo(). Retorna:
+//    - Array  → pagamentos a registrar (pode ser vazio = "pular")
+//    - null   → operador cancelou o fechamento inteiro
+// ═══════════════════════════════════════════════════════════════════
+
+const _MOTOBOY_METODOS_PGTO = [
+  { value: "Efectivo",      label: "💵 Efectivo" },
+  { value: "Pix",           label: "🟢 Pix" },
+  { value: "Transferencia", label: "🏦 Transferencia" },
+  { value: "Cartao",        label: "💳 Tarjeta" },
+  { value: "QrPy",          label: "📱 QR Paraguay" },
+  { value: "Outro",         label: "✏️ Outro" },
+];
+
+async function _abrirModalPagamentoMotoboys(sessaoId, inicioISO, fimISO) {
+  // ── Se a sessão JÁ tem despesas de motoboy registradas, não mostra
+  //    o modal de novo (evita duplo lançamento). ────────────────────
+  const { data: existentes } = await supa
+    .from("movimentacoes_caixa")
+    .select("id")
+    .eq("sessao_id", sessaoId)
+    .eq("tipo", "despesa")
+    .eq("tipo_despesa", "motoboy")
+    .limit(1);
+
+  if (existentes && existentes.length > 0) {
+    console.log("[Motoboy] Despesas já registradas nesta sessão — pulando modal.");
+    return [];
+  }
+
+  // ── Busca motoboys com entregas na janela da sessão ────────────
+  const { data: peds } = await supa
+    .from("pedidos")
+    .select("motoboy_id, frete_motoboy, motoboys(id, nome)")
+    .neq("status", "cancelado")
+    .eq("tipo_entrega", "delivery")
+    .gte("created_at", inicioISO)
+    .lte("created_at", fimISO);
+
+  const mapa = {};
+  (peds || []).forEach((p) => {
+    const id = p.motoboy_id;
+    if (!id) return;
+    const nome = p.motoboys?.nome || "Motoboy";
+    if (!mapa[id]) {
+      mapa[id] = { motoboy_id: id, nome, entregas: 0, freteTotal: 0 };
+    }
+    mapa[id].entregas++;
+    mapa[id].freteTotal += Number(p.frete_motoboy) || 0;
+  });
+
+  const motoboys = Object.values(mapa).sort((a, b) =>
+    a.nome.localeCompare(b.nome),
+  );
+
+  // Sem motoboys com entrega → não mostra modal, retorna vazio
+  if (motoboys.length === 0) return [];
+
+  // Calcula combustível por motoboy (rateio igualitário)
+  const combustivelPorMotoboy =
+    motoboys.length > 0 ? (AJUDA_COMBUSTIVEL || 0) : 0;
+
+  motoboys.forEach((m) => {
+    m.valorSugerido = m.freteTotal + combustivelPorMotoboy;
+  });
+
+  // ── Cria o modal ───────────────────────────────────────────────
+  return new Promise((resolve) => {
+    document.getElementById("_modal-pgto-motoboys")?.remove();
+
+    const overlay = document.createElement("div");
+    overlay.id = "_modal-pgto-motoboys";
+    overlay.style.cssText =
+      "position:fixed;inset:0;background:rgba(0,0,0,0.72);z-index:100000;" +
+      "display:flex;align-items:center;justify-content:center;padding:16px;overflow-y:auto";
+
+    const motoboysHtml = motoboys
+      .map((m, idx) => {
+        const nomeEsc = String(m.nome).replace(/</g, "&lt;");
+        const optsHtml = _MOTOBOY_METODOS_PGTO.map(
+          (o) =>
+            `<option value="${o.value}"${o.value === "Efectivo" ? " selected" : ""}>${o.label}</option>`,
+        ).join("");
+        return `
+          <div style="background:#fff;border:1.5px solid #e5e7eb;border-radius:12px;
+               padding:12px 14px;margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px">
+              <div style="min-width:0">
+                <div style="font-weight:700;color:#1e293b;font-size:0.95rem">${nomeEsc}</div>
+                <div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">
+                  ${m.entregas} entrega${m.entregas > 1 ? "s" : ""} ·
+                  Sugerido: Gs ${m.valorSugerido.toLocaleString("es-PY")}
+                </div>
+              </div>
+              <label style="display:flex;align-items:center;gap:6px;font-size:0.78rem;color:#475569;cursor:pointer;flex-shrink:0">
+                <input type="checkbox" data-idx="${idx}" data-role="pagar" checked
+                  style="width:16px;height:16px;accent-color:#1a7a2e"
+                  onchange="_motoboyTogglePagar(this)">
+                Pagar
+              </label>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <div>
+                <label style="display:block;font-size:0.7rem;font-weight:600;color:#94a3b8;
+                       text-transform:uppercase;letter-spacing:0.3px;margin-bottom:3px">
+                  Valor (Gs)
+                </label>
+                <input type="number" data-idx="${idx}" data-role="valor"
+                  value="${m.valorSugerido}" min="0" step="1000"
+                  style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;
+                         border-radius:8px;font-size:0.9rem;font-weight:600;
+                         box-sizing:border-box;outline:none"
+                  oninput="_motoboyRecalcularTotal()">
+              </div>
+              <div>
+                <label style="display:block;font-size:0.7rem;font-weight:600;color:#94a3b8;
+                       text-transform:uppercase;letter-spacing:0.3px;margin-bottom:3px">
+                  Forma de Pagamento
+                </label>
+                <select data-idx="${idx}" data-role="metodo"
+                  style="width:100%;padding:8px 10px;border:1.5px solid #e5e7eb;
+                         border-radius:8px;font-size:0.9rem;background:#fff;
+                         box-sizing:border-box;outline:none"
+                  onchange="_motoboyRecalcularTotal()">
+                  ${optsHtml}
+                </select>
+              </div>
+            </div>
+          </div>`;
+      })
+      .join("");
+
+    overlay.innerHTML = `
+      <div style="background:#fff;border-radius:18px;max-width:540px;width:100%;
+                  max-height:92vh;overflow:hidden;display:flex;flex-direction:column;
+                  box-shadow:0 24px 80px rgba(0,0,0,0.4)">
+        <div style="background:linear-gradient(135deg,#1e40af,#1e3a8a);color:#fff;
+                    padding:20px 24px;flex-shrink:0">
+          <div style="display:flex;align-items:center;gap:10px">
+            <div style="font-size:1.6rem">🏍️</div>
+            <div>
+              <div style="font-size:1.15rem;font-weight:800">Pagamento aos Motoboys</div>
+              <div style="font-size:0.8rem;opacity:0.85;margin-top:2px">
+                Confirme o valor e a forma de pagamento de cada um. Os valores
+                entram como <b>despesas</b> na sessão.
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div style="padding:18px 20px;overflow-y:auto;flex:1">
+          <div id="_pgto-motoboys-lista">${motoboysHtml}</div>
+        </div>
+
+        <div style="padding:14px 20px;border-top:2px solid #e2e8f0;background:#f8fafc;flex-shrink:0">
+          <div style="display:flex;justify-content:space-between;font-size:0.85rem;color:#475569;margin-bottom:6px">
+            <span>🏍️ Total a pagar (motoboys)</span>
+            <strong id="_pgto-motoboys-total" style="color:#1e40af">Gs 0</strong>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:0.82rem;color:#dc2626;margin-bottom:10px">
+            <span>💵 Em efectivo (sai da gaveta)</span>
+            <strong id="_pgto-motoboys-efetivo">Gs 0</strong>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button id="_pgto-motoboys-pular"
+              style="flex:1;padding:13px;background:#fff;color:#64748b;
+                     border:1.5px solid #e2e8f0;border-radius:10px;font-weight:700;
+                     font-size:0.88rem;cursor:pointer">
+              Pular
+            </button>
+            <button id="_pgto-motoboys-confirmar"
+              style="flex:2;padding:13px;background:linear-gradient(135deg,#1a7a2e,#145a22);
+                     color:#fff;border:none;border-radius:10px;font-weight:800;
+                     font-size:0.92rem;cursor:pointer;box-shadow:0 4px 14px rgba(26,122,46,0.35)">
+              ✅ Registrar Pagamentos
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    // Expõe função para o onchange dos inputs
+    window._motoboyRecalcularTotal = function () {
+      const inputs  = overlay.querySelectorAll('[data-role="valor"]');
+      const selects = overlay.querySelectorAll('[data-role="metodo"]');
+      const checks  = overlay.querySelectorAll('[data-role="pagar"]');
+      let total = 0;
+      let efetivo = 0;
+      inputs.forEach((inp, i) => {
+        const pagar = checks[i]?.checked;
+        if (!pagar) return;
+        const v = parseFloat(inp.value) || 0;
+        total += v;
+        if ((selects[i]?.value || "") === "Efectivo") efetivo += v;
+      });
+      const totalEl = overlay.querySelector("#_pgto-motoboys-total");
+      const efetivoEl = overlay.querySelector("#_pgto-motoboys-efetivo");
+      if (totalEl) totalEl.textContent = "Gs " + total.toLocaleString("es-PY");
+      if (efetivoEl) efetivoEl.textContent = "Gs " + efetivo.toLocaleString("es-PY");
+    };
+
+    window._motoboyTogglePagar = function (checkbox) {
+      const idx = checkbox.dataset.idx;
+      const valorEl = overlay.querySelector(`input[data-role="valor"][data-idx="${idx}"]`);
+      const selEl = overlay.querySelector(`select[data-role="metodo"][data-idx="${idx}"]`);
+      if (valorEl) {
+        valorEl.disabled = !checkbox.checked;
+        valorEl.style.opacity = checkbox.checked ? "1" : "0.4";
+      }
+      if (selEl) {
+        selEl.disabled = !checkbox.checked;
+        selEl.style.opacity = checkbox.checked ? "1" : "0.4";
+      }
+      window._motoboyRecalcularTotal();
+    };
+
+    // Inicializa totais
+    window._motoboyRecalcularTotal();
+
+    // Handlers dos botões
+    overlay.querySelector("#_pgto-motoboys-pular").addEventListener("click", () => {
+      overlay.remove();
+      resolve([]);
+    });
+
+    overlay.querySelector("#_pgto-motoboys-confirmar").addEventListener("click", () => {
+      const checks  = overlay.querySelectorAll('[data-role="pagar"]');
+      const inputs  = overlay.querySelectorAll('[data-role="valor"]');
+      const selects = overlay.querySelectorAll('[data-role="metodo"]');
+
+      const resultado = [];
+      inputs.forEach((inp, i) => {
+        if (!checks[i]?.checked) return;
+        const valor = parseFloat(inp.value) || 0;
+        if (valor <= 0) return;
+        resultado.push({
+          motoboy_id: motoboys[i].motoboy_id,
+          nome: motoboys[i].nome,
+          valor,
+          metodo: selects[i]?.value || "Efectivo",
+        });
+      });
+
+      overlay.remove();
+      resolve(resultado);
+    });
+  });
 }
 
 async function fecharCaixaResumo() {
@@ -3591,6 +3935,32 @@ async function fecharCaixaResumo() {
   const nomeAtual     = document.getElementById("user-nome-display")?.innerText || emailAtual;
   const fechadoEm     = new Date().toISOString();
 
+  // ══════════════════════════════════════════════════════════════
+  //  NOVO: modal de pagamento aos motoboys ANTES do cálculo.
+  //  - retorna array (pode ser vazio = "pular")
+  //  - retorna null se o operador cancelou o fechamento inteiro
+  // ══════════════════════════════════════════════════════════════
+  let pagamentosMotoboys = [];
+  try {
+    pagamentosMotoboys = await _abrirModalPagamentoMotoboys(
+      sessaoId,
+      abertoEm,
+      fechadoEm,
+    );
+  } catch (e) {
+    console.warn("[fecharCaixaResumo] Erro no modal motoboy:", e);
+    pagamentosMotoboys = [];
+  }
+
+  if (pagamentosMotoboys === null) {
+    console.log("[fecharCaixaResumo] Operador cancelou o fechamento.");
+    return;
+  }
+
+  if (pagamentosMotoboys.length > 0) {
+    await _inserirPagamentosMotoboys(pagamentosMotoboys, sessaoId);
+  }
+
   // ── 2. Feedback visual durante o cálculo ────────────────────────
   const _btnFechar = document.querySelector('[onclick="fecharCaixaResumo()"]');
   const _textOrigBtn = _btnFechar ? _btnFechar.innerHTML : "";
@@ -3609,8 +3979,11 @@ async function fecharCaixaResumo() {
     // ── 4. Salva snapshot em caixa_fechamentos ────────────────────
     const detalhesJSON = {
       gerado_por: "admin.js:fecharCaixaResumo",
-      versao:     "1.0",
-      calculo:    "view_vw_sessao_resumo",
+      versao:     "1.1",
+      calculo:    "view_vw_sessao_resumo + ajuste_frete",
+      motoboy_pagamentos: pagamentosMotoboys.map((p) => ({
+        nome: p.nome, valor: p.valor, metodo: p.metodo,
+      })),
     };
 
     const { error: errSnap } = await supa
@@ -3678,10 +4051,7 @@ async function fecharCaixaResumo() {
         sessao_id:     sessaoId,
       }]);
 
-    // ── 7. 🔧 CORREÇÃO: modal com botão de impressão explícito.
-    //    Substitui o alert+confirm anteriores — o confirm() após um
-    //    alert() muito longo é auto-descartado por alguns navegadores
-    //    e o window.open() subsequente perdia o user gesture.
+    // ── 7. Modal de fechamento com botão de impressão explícito ───
     _mostrarModalFechamentoCaixa({
       sessao_id:           sessaoId,
       usuario_email:       emailAtual,
@@ -3690,6 +4060,8 @@ async function fecharCaixaResumo() {
       fechado_em:          fechadoEm,
       valor_abertura:      valorAbertura,
       faturamento:         r.faturamento,
+      frete_cobrado:       r.frete_cobrado,
+      frete_em_especie:    r.frete_em_especie,
       qtd_pedidos:         r.qtd_pedidos,
       custo_entregas:      r.custo_entregas,
       total_despesas:      r.total_despesas,
@@ -3704,6 +4076,7 @@ async function fecharCaixaResumo() {
       total_transferencia: r.total_transferencia,
       total_qr_py:         r.total_qr_py,
       total_multi_outros:  r.total_multi_outros,
+      motoboy_pagamentos:  pagamentosMotoboys,
     });
 
     // ── 8. Limpa estado local e atualiza UI ───────────────────────
@@ -3756,7 +4129,7 @@ async function fecharCaixaResumo() {
     }
     _pdvAtualizarPainelCaixa();
 
-    // Recarrega o financeiro (sem sessão ativa → mostra pedidos do período atual)
+    // Recarrega o financeiro
     await calcularFinanceiro();
 
   } catch (e) {
@@ -3769,6 +4142,34 @@ async function fecharCaixaResumo() {
       _btnFechar.style.opacity = "1";
     }
   }
+}
+
+/**
+ * Insere os pagamentos aos motoboys como despesas na sessão.
+ * Guarda o método de pagamento em `descricao_outro` (compatível com o
+ * schema atual — não exige ALTER TABLE).
+ */
+async function _inserirPagamentosMotoboys(pagamentos, sessaoId) {
+  if (!pagamentos?.length) return;
+
+  const emailAtual = document.getElementById("user-email")?.innerText || "sistema";
+  const rows = pagamentos.map((p) => ({
+    tipo:             "despesa",
+    valor:            p.valor,
+    descricao:        `Pagamento Motoboy — ${p.nome}`,
+    usuario_email:    emailAtual,
+    tipo_despesa:     "motoboy",
+    descricao_outro:  p.metodo, // guarda a forma de pagamento
+    sessao_id:        sessaoId,
+  }));
+
+  const { error } = await supa.from("movimentacoes_caixa").insert(rows);
+  if (error) {
+    console.error("[Motoboy] Erro ao inserir despesas:", error);
+    alert("⚠️ Não foi possível registrar os pagamentos aos motoboys:\n" + error.message);
+    return;
+  }
+  console.log(`✅ ${pagamentos.length} pagamento(s) de motoboy registrado(s).`);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -3794,11 +4195,54 @@ function _mostrarModalFechamentoCaixa(f) {
       hour: "2-digit", minute: "2-digit",
     });
   };
-  const linha = (label, valor) =>
-    `<div style="display:flex;justify-content:space-between;font-size:0.85rem;color:#555;padding:3px 0">
+  const linha = (label, valor, cor) =>
+    `<div style="display:flex;justify-content:space-between;font-size:0.85rem;color:${cor || "#555"};padding:3px 0">
        <span>${label}</span>
-       <span style="font-weight:600;color:#334155">${fmt(valor)}</span>
+       <span style="font-weight:600;color:${cor || "#334155"}">${fmt(valor)}</span>
      </div>`;
+
+  // ── Bloco de pagamentos aos motoboys (se registrados) ─────────
+  const pagamentos = Array.isArray(f.motoboy_pagamentos) ? f.motoboy_pagamentos : [];
+  let motoboyBloco = "";
+  if (pagamentos.length > 0) {
+    const itens = pagamentos.map((p) => {
+      const iconPgto = {
+        Efectivo: "💵", Pix: "🟢", Transferencia: "🏦",
+        Cartao: "💳", QrPy: "📱", Outro: "✏️",
+      }[p.metodo] || "💰";
+      const nomeEsc = String(p.nome).replace(/</g, "&lt;");
+      return `<div style="display:flex;justify-content:space-between;font-size:0.82rem;color:#475569;padding:3px 0">
+        <span>${iconPgto} ${nomeEsc} <span style="color:#94a3b8;font-size:0.75rem">(${p.metodo})</span></span>
+        <span style="font-weight:700;color:#1e40af">${fmt(p.valor)}</span>
+      </div>`;
+    }).join("");
+
+    const totalPag = pagamentos.reduce((a, p) => a + (Number(p.valor) || 0), 0);
+    const totalEfet = pagamentos
+      .filter((p) => (p.metodo || "").toLowerCase().includes("efetivo"))
+      .reduce((a, p) => a + (Number(p.valor) || 0), 0);
+
+    motoboyBloco = `
+      <div style="background:#eff6ff;border:1.5px solid #bfdbfe;border-radius:10px;padding:12px 14px;margin-bottom:16px">
+        <div style="font-size:0.75rem;font-weight:700;color:#1e40af;text-transform:uppercase;
+             letter-spacing:0.5px;margin-bottom:8px">
+          🏍️ Pagamento aos Motoboys
+        </div>
+        ${itens}
+        <div style="display:flex;justify-content:space-between;font-size:0.88rem;font-weight:800;
+             color:#1e3a8a;padding-top:8px;margin-top:6px;border-top:1px dashed #93c5fd">
+          <span>Total pago</span>
+          <span>${fmt(totalPag)}</span>
+        </div>
+        ${totalEfet > 0
+          ? `<div style="display:flex;justify-content:space-between;font-size:0.78rem;
+               color:#dc2626;margin-top:4px">
+               <span>💵 Saído da gaveta (efectivo)</span>
+               <span style="font-weight:700">${fmt(totalEfet)}</span>
+             </div>`
+          : ""}
+      </div>`;
+  }
 
   const overlay = document.createElement("div");
   overlay.id = "_modal-fechamento";
@@ -3823,16 +4267,22 @@ function _mostrarModalFechamentoCaixa(f) {
 
         <div style="margin-bottom:16px">
           <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">
-            💰 Faturamento
+            💰 Receita da Loja
           </div>
           <div style="display:flex;justify-content:space-between;font-size:0.9rem;margin-bottom:4px">
-            <span style="color:#555">Faturamento Total</span>
+            <span style="color:#555">Faturamento (sem frete)</span>
             <strong>${fmt(f.faturamento)}</strong>
           </div>
           <div style="display:flex;justify-content:space-between;font-size:0.9rem">
             <span style="color:#555">📦 Pedidos</span>
             <strong>${f.qtd_pedidos}</strong>
           </div>
+          ${(f.frete_cobrado || 0) > 0
+            ? `<div style="display:flex;justify-content:space-between;font-size:0.82rem;margin-top:6px;padding-top:6px;border-top:1px dashed #e5e7eb;color:#94a3b8">
+                 <span>🛵 Frete cobrado (repasse motoboy)</span>
+                 <span style="font-weight:600">${fmt(f.frete_cobrado)}</span>
+               </div>`
+            : ""}
         </div>
 
         <div style="margin-bottom:16px">
@@ -3848,12 +4298,13 @@ function _mostrarModalFechamentoCaixa(f) {
           ${(f.total_multi_outros || 0) > 0 ? linha("🔀 Multi/Outros", f.total_multi_outros) : ""}
         </div>
 
+        ${motoboyBloco}
+
         <div style="margin-bottom:16px">
           <div style="font-size:0.78rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px">
             📋 Movimentações
           </div>
-          ${linha("🏍️ Custo Entregas", f.custo_entregas)}
-          ${linha("💸 Despesas", f.total_despesas)}
+          ${linha("💸 Outras Despesas", f.total_despesas - (f.motoboy_total || 0))}
           ${linha("💸 Sangrias", f.total_sangrias)}
           ${linha("➕ Suprimentos", f.total_suprimentos)}
         </div>
@@ -3890,7 +4341,7 @@ function _mostrarModalFechamentoCaixa(f) {
   overlay.querySelector("#_btn-fechar-modal-fech").onclick = () => overlay.remove();
   overlay.querySelector("#_btn-imprimir-fech").onclick = () => {
     overlay.remove();
-    _abrirJanelaImpressaoFechamento(f);   // chamada com user gesture válido
+    _abrirJanelaImpressaoFechamento(f);
   };
 }
 
@@ -9589,7 +10040,44 @@ async function carregarPDV() {
   _injetarBadgeNoMenuPDV();
   await _atualizarBadgePedidosPendentes();
 
-  _pdvRealocarBuscaParaTopo();
+    _pdvRealocarBuscaParaTopo();
+
+  // ⚠️ Revalida cache quando o operador volta o foco ao PDV.
+  // Evita vender produto que esgotou enquanto a aba estava em background
+  // (ex: operador trocou pra aba Pedidos e outro vendeu a última unidade).
+  if (!window._pdvFocusListenerBound) {
+    window._pdvFocusListenerBound = true;
+    window.addEventListener("focus", async () => {
+      if (localStorage.getItem("app_lastTab") !== "pdv") return;
+      try {
+        const { data: prodsFresh } = await supa
+          .from("produtos")
+          .select("id, nome, estoque_qtd, ativo")
+          .eq("ativo", true);
+        if (!prodsFresh?.length) return;
+        let atualizados = 0;
+        prodsFresh.forEach((fp) => {
+          const cached = produtosCachePDV.find((p) => p.id === fp.id);
+          if (
+            cached &&
+            cached.estoque_qtd !== fp.estoque_qtd &&
+            (cached.estoque_qtd !== null || fp.estoque_qtd !== null)
+          ) {
+            cached.estoque_qtd = fp.estoque_qtd;
+            atualizados++;
+          }
+        });
+        if (atualizados > 0) {
+          console.log(
+            `[PDV] 🔄 Cache revalidado: ${atualizados} produto(s) atualizado(s)`,
+          );
+          renderizarGridPDV(document.getElementById("pdv-busca")?.value || "");
+        }
+      } catch (_) {
+        /* silencioso */
+      }
+    });
+  }
 }
 
 /**
@@ -10187,79 +10675,42 @@ function _pdvMostrarToast(msg, cor, duracao) {
 }
 
 function adicionarItemPDV(p) {
-  // montagem_config pode chegar como string JSON de bancos antigos
-  let cfg = p.montagem_config;
-  if (typeof cfg === "string") {
-    try {
-      cfg = JSON.parse(cfg);
-    } catch (_) {
-      cfg = null;
-    }
-  }
-  const tipo = cfg && !Array.isArray(cfg) && cfg.__tipo ? cfg.__tipo : null;
-
-  // Kg → modal de peso/balança
-  if (tipo === "kg") {
-    _mostrarModalPesoPDV(p, cfg.preco_kg || p.preco || 0);
-    return;
-  }
-
-  // Tipos com seleção obrigatória → abre modal de opções
-  if (tipo === "variacoes" && cfg.variacoes?.length > 0) {
-    const ativas = cfg.variacoes.filter((v) => v.ativo !== false);
-    if (!ativas.length) {
-      alert("⏸️ Todas as variações estão pausadas.");
-      return;
-    }
-    _mostrarModalOpcoesPDV(p, "variacoes");
-    return;
-  }
-  if (tipo === "pizza") {
-    _mostrarModalOpcoesPDV(p, "pizza");
-    return;
-  }
-  if (tipo === "acai") {
-    _mostrarModalOpcoesPDV(p, "acai");
-    return;
-  }
-  if (tipo === "shake") {
-    _mostrarModalOpcoesPDV(p, "shake");
-    return;
-  }
-  if (tipo === "suco") {
-    _mostrarModalOpcoesPDV(p, "suco");
-    return;
-  }
-  if (tipo === "sorvete") {
-    _mostrarModalOpcoesPDV(p, "sorvete");
-    return;
-  }
-  if (tipo === "montavel" && cfg.etapas?.length > 0) {
-    _mostrarModalOpcoesPDV(p, "montavel");
-    return;
-  }
-
-    // Simples / Lanche / Bebida / Combo — adiciona direto
-    // Aplica o multiplicador atual (botões +5/+10 ou prefixo "10+")
-    const mult = Math.max(1, parseInt(window._pdvQtyMultiplier || 1, 10));
-    const existe = carrinhoPDV.find((i) => i.id === p.id && !i.variacao);
-    if (existe) existe.qtd += mult;
-    else carrinhoPDV.push({
-      ...p,
-      qtd: mult,
-      montagem: [],
-      obs: "",
-      _extrasSoma: 0,
-    });
-    // Reseta multiplicador após adicionar
-    pdvSetQtyMultiplier(1);
-    atualizarCarrinhoPDV();
-
-  if (_deveMostrarExtrasGlobais(p)) {
-    _getExtrasGlobais().then((extras) => {
-      if (extras?.length > 0) _mostrarUpsellExtrasPDV(p, extras);
-    });
-  }
+  // ⚠️ Revalidação silenciosa de estoque: consulta o banco em background
+  // e, se o produto esgotou, avisa o operador sem bloquear o fluxo.
+  if (!p._isExtra && p.id && !p._isKg) {
+    supa
+      .from("produtos")
+      .select("estoque_qtd, ativo")
+      .eq("id", p.id)
+      .single()
+      .then(({ data: fresh }) => {
+        if (!fresh) return;
+        if (fresh.ativo === false) {
+          _pdvMostrarToast(
+            `⚠️ "${p.nome}" está pausado no cadastro.`,
+            "#f59e0b",
+            3500,
+          );
+        } else if (
+          fresh.estoque_qtd !== null &&
+          fresh.estoque_qtd !== undefined &&
+          fresh.estoque_qtd <= 0
+        ) {
+          _pdvMostrarToast(
+            `⚠️ "${p.nome}" acabou de esgotar — verifique estoque físico.`,
+            "#dc2626",
+            4000,
+          );
+        }
+        // Atualiza cache local pra próxima renderização
+        const cached = produtosCachePDV.find((x) => x.id === p.id);
+        if (cached) {
+          cached.estoque_qtd = fresh.estoque_qtd;
+          cached.ativo = fresh.ativo;
+        }
+      })
+      .catch(() => {});
+}
 }
 
 // ── Modal unificado de opções para PDV ────────────────────────────
@@ -14803,15 +15254,17 @@ function _todosBebidas(itens) {
 }
 
 // Desconta estoque a partir de uma lista de itens (para UPDATE de mesa)
-// CORREÇÃO: agora também desconta produtos que controlam estoque via
-// produtos.estoque_qtd (não só via inventario_id) — ver nota em
-// _descontarEstoqueVenda() acima para o contexto completo do bug.
-// Desconta contando os itens do carrinho
+//
+// ⚠️ CORREÇÃO — race condition: agora usa a RPC atômica
+// `descontar_estoque_atomico` (criada no SQL do Fix 3 anterior).
+// Antes fazia SELECT → JS → UPDATE, o que causava race quando dois
+// operadores adicionavam itens à mesma mesa simultaneamente.
 async function _descontarEstoqueVendaItens(itens) {
   const falhas = [];
   try {
     if (!itens?.length) return { ok: true, falhas };
 
+    // ── Sanitiza IDs ──
     const prodIds = [
       ...new Set(
         itens
@@ -14819,35 +15272,335 @@ async function _descontarEstoqueVendaItens(itens) {
           .filter((id) => Number.isInteger(id) && id > 0)
       ),
     ];
-    if (!prodIds.length) return { ok: true, falhas };
+    const varIds = [
+      ...new Set(
+        itens
+          .map((i) => Number(i.variacao_id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      ),
+    ];
 
-    const { data: prods, error: errProds } = await supa
-      .from("produtos")
-      .select("id, nome, inventario_id, estoque_qtd")
-      .in("id", prodIds);
+    if (!prodIds.length && !varIds.length) return { ok: true, falhas };
 
-    if (errProds) { falhas.push({ tipo: "query_produtos", motivo: errProds.message }); return { ok: false, falhas }; }
-    if (!prods?.length) {
-      falhas.push({ tipo: "produtos_nao_encontrados", motivo: `IDs: ${prodIds.join(", ")}` });
+    // ── Busca produtos e variações em paralelo ──────────────────
+    const [{ data: prods, error: errProds }, { data: variacoes }] =
+      await Promise.all([
+        prodIds.length
+          ? supa.from("produtos")
+              .select("id, nome, inventario_id, estoque_qtd")
+              .in("id", prodIds)
+          : Promise.resolve({ data: [] }),
+        varIds.length
+          ? supa.from("produto_variacoes")
+              .select("id, produto_id, nome, estoque_qtd, controlar_estoque")
+              .in("id", varIds)
+          : Promise.resolve({ data: [] }),
+      ]);
+
+    if (errProds) {
+      falhas.push({ tipo: "query_produtos", motivo: errProds.message });
       return { ok: false, falhas };
     }
 
-    const getQtd = (item) => parseInt(item.qtd ?? item.q ?? item.quantidade ?? 1) || 1;
-    const qtdVendidaPorProduto = {};
+    const getQtd = (item) =>
+      parseInt(item.qtd ?? item.q ?? item.quantidade ?? 1) || 1;
+
+    // ── 1. Desconto em variações ────────────────────────────────
+    const mapaVariacoes = {};
+    (variacoes || []).forEach((v) => { mapaVariacoes[v.id] = v; });
+
+    const qtdPorVariacao = {};
     itens.forEach((item) => {
+      const vid = Number(item.variacao_id);
+      if (!Number.isInteger(vid) || vid <= 0) return;
+      qtdPorVariacao[vid] = (qtdPorVariacao[vid] || 0) + getQtd(item);
+    });
+
+    for (const [vid, qtd] of Object.entries(qtdPorVariacao)) {
+      const v = mapaVariacoes[vid];
+      if (!v) {
+        falhas.push({ tipo: "variacao", id: vid, motivo: "Variação não encontrada" });
+        continue;
+      }
+      if (v.controlar_estoque === false) continue;
+
+      const { data: fresh } = await supa
+        .from("produto_variacoes").select("estoque_qtd").eq("id", vid).single();
+      const atual = fresh?.estoque_qtd ?? v.estoque_qtd ?? 0;
+      const { data: _r, error: _e } = await supa
+        .from("produto_variacoes")
+        .update({ estoque_qtd: Math.max(0, atual - qtd) })
+        .eq("id", vid).select("id");
+      if (_e || !_r?.length) {
+        falhas.push({
+          tipo: "variacao", id: vid, nome: v.nome,
+          motivo: _e?.message || "0 linhas afetadas",
+        });
+      }
+    }
+
+    // ── 2. Desconto em produtos SEM variação ────────────────────
+    const prodsSemVar = (prods || []).filter(
+      (p) => !itens.some((i) =>
+        Number(i.produto_id ?? i.id) === p.id && Number(i.variacao_id) > 0,
+      ),
+    );
+
+    const qtdPorProduto = {};
+    itens.forEach((item) => {
+      if (Number(item.variacao_id) > 0) return;
       const pid = Number(item.produto_id ?? item.id);
       if (!Number.isInteger(pid) || pid <= 0) return;
-      qtdVendidaPorProduto[pid] = (qtdVendidaPorProduto[pid] || 0) + getQtd(item);
+      qtdPorProduto[pid] = (qtdPorProduto[pid] || 0) + getQtd(item);
     });
+
+    // Caminho inventario
+    const descontosInv = {};
+    prodsSemVar.forEach((p) => {
+      if (!p.inventario_id) return;
+      const q = qtdPorProduto[p.id];
+      if (!q) return;
+      descontosInv[p.inventario_id] = (descontosInv[p.inventario_id] || 0) + q;
+    });
+
+    if (Object.keys(descontosInv).length > 0) {
+      const invIds = Object.keys(descontosInv).map(Number);
+      const { data: estoques } = await supa
+        .from("inventario").select("id, quantidade").in("id", invIds);
+      for (const est of estoques || []) {
+        const nova = Math.max(0, Number(est.quantidade ?? 0) - descontosInv[est.id]);
+        const { data: _rows, error: _err } = await supa
+          .from("inventario").update({ quantidade: nova })
+          .eq("id", est.id).select("id");
+        if (_err || !_rows?.length) {
+          falhas.push({
+            tipo: "inventario", id: est.id,
+            motivo: _err?.message || "0 linhas afetadas",
+          });
+        } else {
+          await supa.from("inventario_movimentos").insert([{
+            inventario_id: est.id,
+            tipo: "sub",
+            quantidade: descontosInv[est.id],
+            motivo: "Venda PDV (mesa — itens adicionados)",
+            usuario_email: "sistema",
+          }]).then(() => {}).catch(() => {});
+        }
+      }
+    }
+
+    // Caminho estoque_qtd + RPC
+    for (const prod of prodsSemVar) {
+      if (prod.estoque_qtd === null || prod.estoque_qtd === undefined) continue;
+      const qtdVendida = qtdPorProduto[prod.id];
+      if (!qtdVendida) continue;
+
+      const { data: rpc, error: rpcErr } = await supa
+        .rpc("descontar_estoque_atomico", {
+          p_produto_id: prod.id,
+          p_qtd: qtdVendida,
+        });
+
+      if (rpcErr) {
+        const { data: fresh } = await supa
+          .from("produtos").select("estoque_qtd").eq("id", prod.id).single();
+        const atual = fresh?.estoque_qtd ?? prod.estoque_qtd;
+        const novaQtd = Math.max(0, atual - qtdVendida);
+        const payload = { estoque_qtd: novaQtd };
+        if (novaQtd === 0) payload.ativo = false;
+        const { data: _r, error: _e } = await supa
+          .from("produtos").update(payload).eq("id", prod.id).select("id");
+        if (_e || !_r?.length) {
+          falhas.push({
+            tipo: "produto", id: prod.id, nome: prod.nome,
+            motivo: _e?.message || "0 linhas afetadas",
+          });
+        }
+      } else if (rpc && rpc[0] && !rpc[0].sucesso) {
+        falhas.push({
+          tipo: "produto", id: prod.id, nome: prod.nome,
+          motivo: rpc[0].motivo || "RPC retornou sucesso=false",
+        });
+      }
+    }
+
+    if (falhas.length) {
+      console.error("❌ Falha ao descontar estoque (itens):", falhas);
+    } else {
+      const total =
+        Object.keys(descontosInv).length +
+        Object.keys(qtdPorVariacao).length +
+        prodsSemVar.length;
+      console.log(`✅ Estoque descontado (itens): ${total} item(s)`);
+    }
+    return { ok: falhas.length === 0, falhas };
+  } catch (e) {
+    console.warn("Estoque desconto (itens):", e.message);
+    falhas.push({ tipo: "excecao", motivo: e.message });
+    return { ok: false, falhas };
+  }
+}
+
+/**
+ * Desconta estoque a partir de pedidoId OU lista de itens.
+ *
+ * ⚠️ MUDANÇA ARQUITETURAL — race condition:
+ * A versão anterior fazia `SELECT → JS calcula → UPDATE`, o que causa
+ * race condition quando 2 vendas simultâneas leem o mesmo estoque e
+ * gravam o mesmo valor (perde 1 unidade de baixa). Agora usamos a RPC
+ * `descontar_estoque_atomico` que faz lock + update em uma única
+ * transação Postgres.
+ *
+ * Continua suportando DOIS mecanismos:
+ *   a) produtos.inventario_id → tabela `inventario`
+ *   b) produtos.estoque_qtd   → estoque direto na linha do produto
+ */
+async function _descontarEstoqueVenda(pedidoId, itensDireto) {
+  const falhas = [];
+  try {
+    let itens = itensDireto;
+    if (!itens) {
+      const { data: pedido } = await supa
+        .from("pedidos").select("itens").eq("id", pedidoId).single();
+      itens = pedido?.itens;
+    }
+    if (!itens?.length) return { ok: true, falhas };
+
+    // ── Sanitiza IDs: só inteiros > 0 ──
+    const prodIds = [
+      ...new Set(
+        itens
+          .map((i) => Number(i.produto_id ?? i.id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      ),
+    ];
+
+    // 🔧 IDs de variação (se houver)
+    const varIds = [
+      ...new Set(
+        itens
+          .map((i) => Number(i.variacao_id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      ),
+    ];
+
+    if (!prodIds.length) return { ok: true, falhas };
+
+    // 🔧 Busca produtos E variações em paralelo
+    const [{ data: prods, error: errProds }, { data: variacoes, error: errVars }] =
+      await Promise.all([
+        supa.from("produtos")
+          .select("id, nome, inventario_id, estoque_qtd")
+          .in("id", prodIds),
+        varIds.length
+          ? supa.from("produto_variacoes")
+              .select("id, produto_id, nome, estoque_qtd, controlar_estoque")
+              .in("id", varIds)
+          : Promise.resolve({ data: [], error: null }),
+      ]);
+
+    if (errProds) {
+      falhas.push({ tipo: "query_produtos", motivo: errProds.message });
+      return { ok: false, falhas };
+    }
+    if (!prods?.length) {
+      falhas.push({
+        tipo: "produtos_nao_encontrados",
+        motivo: `IDs: ${prodIds.join(", ")}`,
+      });
+      return { ok: false, falhas };
+    }
+
+    const getQtd = (item) =>
+      parseInt(item.qtd ?? item.q ?? item.quantidade ?? 1) || 1;
+
+    // ═══════════════════════════════════════════════════════════════
+    //  🔧 CORREÇÃO CRÍTICA #2 — Deduza variações ANTES do produto-pai
+    //
+    //  Se o item tem `variacao_id`, desconta em produto_variacoes
+    //  e não toca no estoque_qtd do produto-pai (que costuma ser NULL).
+    // ═══════════════════════════════════════════════════════════════
+    const mapaVariacoes = {};
+    (variacoes || []).forEach((v) => { mapaVariacoes[v.id] = v; });
+
+    // Mapa: variacao_id → qtd vendida
+    const qtdPorVariacao = {};
+    itens.forEach((item) => {
+      const vid = Number(item.variacao_id);
+      if (!Number.isInteger(vid) || vid <= 0) return;
+      qtdPorVariacao[vid] = (qtdPorVariacao[vid] || 0) + getQtd(item);
+    });
+
+    // Produtos que NÃO têm variação_id — descontam normalmente
+    const produtosSemVariacao = new Set(prodIds);
+    itens.forEach((item) => {
+      if (Number(item.variacao_id) > 0) {
+        produtosSemVariacao.delete(Number(item.produto_id ?? item.id));
+      }
+    });
+
+    // ── 2a. Desconto em produto_variacoes ────────────────────────
+    for (const [vid, qtd] of Object.entries(qtdPorVariacao)) {
+      const v = mapaVariacoes[vid];
+      if (!v) {
+        falhas.push({ tipo: "variacao", id: vid, motivo: "Variação não encontrada" });
+        continue;
+      }
+      if (v.controlar_estoque === false) continue;
+
+      const { data: _r, error: _e } = await supa
+        .from("produto_variacoes")
+        .update({ estoque_qtd: Math.max(0, (v.estoque_qtd || 0) - qtd) })
+        .eq("id", vid)
+        .eq("estoque_qtd", v.estoque_qtd)  // 🔒 optimistic lock
+        .select("id");
+
+      if (_e || !_r?.length) {
+        // Tentar com o valor atual novamente (fallback sem lock)
+        const { data: fresh } = await supa
+          .from("produto_variacoes").select("estoque_qtd").eq("id", vid).single();
+        const atual = fresh?.estoque_qtd ?? v.estoque_qtd;
+        const { data: _r2, error: _e2 } = await supa
+          .from("produto_variacoes")
+          .update({ estoque_qtd: Math.max(0, atual - qtd) })
+          .eq("id", vid)
+          .select("id");
+        if (_e2 || !_r2?.length) {
+          falhas.push({
+            tipo: "variacao",
+            id: vid,
+            nome: v.nome,
+            motivo: _e2?.message || "0 linhas afetadas",
+          });
+        }
+      }
+    }
+
+    // ── 2b. Desconto em produtos (sem variação) ──────────────────
+    const prodsParaDescontar = prods.filter(
+      (p) => produtosSemVariacao.has(p.id),
+    );
 
     // Caminho 1: inventario_id
     const descontosInv = {};
-    prods.forEach((prod) => {
+    prodsParaDescontar.forEach((prod) => {
       if (!prod.inventario_id) return;
-      const qtd = qtdVendidaPorProduto[prod.id];
+      const qtd = qtdVendidaPorProdutoMapa(itens, prod.id);
       if (!qtd) return;
-      descontosInv[prod.inventario_id] = (descontosInv[prod.inventario_id] || 0) + qtd;
+      descontosInv[prod.inventario_id] =
+        (descontosInv[prod.inventario_id] || 0) + qtd;
     });
+
+    function qtdVendidaPorProdutoMapa(arr, pid) {
+      let total = 0;
+      arr.forEach((item) => {
+        const p = Number(item.produto_id ?? item.id);
+        if (p !== pid) return;
+        if (Number(item.variacao_id) > 0) return; // já tratado nas variações
+        total += getQtd(item);
+      });
+      return total;
+    }
 
     if (Object.keys(descontosInv).length > 0) {
       const invIds = Object.keys(descontosInv).map(Number);
@@ -14862,148 +15615,15 @@ async function _descontarEstoqueVendaItens(itens) {
             .from("inventario").update({ quantidade: nova })
             .eq("id", est.id).select("id");
           if (_err || !_rows?.length) {
-            falhas.push({ tipo: "inventario", id: est.id, motivo: _err?.message || "0 linhas afetadas" });
-          } else {
-            await supa.from("inventario_movimentos").insert([{
-              inventario_id: est.id, tipo: "sub",
-              quantidade: descontosInv[est.id],
-              motivo: "Venda PDV (balcão)", usuario_email: "sistema",
-            }]).then(() => {}).catch(() => {});
-          }
-        }
-      }
-    }
-
-    // Caminho 2: estoque_qtd
-    const comEstoque = prods.filter(
-      (p) => p.estoque_qtd !== null && p.estoque_qtd !== undefined
-    );
-    for (const prod of comEstoque) {
-      const qtd = qtdVendidaPorProduto[prod.id];
-      if (!qtd) continue;
-      const novaQtd = Math.max(0, (prod.estoque_qtd || 0) - qtd);
-      const updatePayload = { estoque_qtd: novaQtd };
-      if (novaQtd === 0) updatePayload.ativo = false;
-      const { data: _rows, error: _err } = await supa
-        .from("produtos").update(updatePayload)
-        .eq("id", prod.id).select("id");
-      if (_err || !_rows?.length) {
-        falhas.push({ tipo: "produto", id: prod.id, nome: prod.nome, motivo: _err?.message || "0 linhas afetadas" });
-      }
-    }
-
-    if (falhas.length) {
-      console.error("❌ Falha ao descontar estoque (itens):", falhas);
-    } else {
-      console.log(`✅ Estoque descontado: ${Object.keys(descontosInv).length + comEstoque.length} item(s)`);
-    }
-    return { ok: falhas.length === 0, falhas };
-  } catch (e) {
-    console.warn("Estoque desconto (itens):", e.message);
-    falhas.push({ tipo: "excecao", motivo: e.message });
-    return { ok: false, falhas };
-  }
-}
-
-// Desconta estoque a partir de pedidoId OU lista de itens
-//
-// CORREÇÃO IMPORTANTE: o sistema tem DOIS mecanismos de controle de estoque
-// que não se comunicavam:
-//   1) produtos.inventario_id → tabela `inventario` (estoque vinculado/insumo)
-//   2) produtos.estoque_qtd   → controle direto na própria linha do produto
-//      (usado pela tela "Gestão de Estoque" / cadastro de produto simples)
-// A função antiga só descontava (1), então produtos cadastrados com (2)
-// — como a maioria dos produtos simples — nunca tinham o estoque baixado.
-// Agora a função verifica e desconta em AMBOS, dependendo de qual campo
-// o produto usa.
-async function _descontarEstoqueVenda(pedidoId, itensDireto) {
-  const falhas = [];
-  try {
-    let itens = itensDireto;
-    if (!itens) {
-      const { data: pedido } = await supa
-        .from("pedidos").select("itens").eq("id", pedidoId).single();
-      itens = pedido?.itens;
-    }
-    if (!itens?.length) return { ok: true, falhas };
-
-    // ── Sanitiza IDs: só inteiros > 0 (descarta "ext_...", null, undefined, NaN) ──
-    const prodIds = [
-      ...new Set(
-        itens
-          .map((i) => Number(i.produto_id ?? i.id))
-          .filter((id) => Number.isInteger(id) && id > 0)
-      ),
-    ];
-    // Se TODOS os itens foram filtrados (só extras/adicionais), nada a baixar
-    if (!prodIds.length) return { ok: true, falhas };
-
-    const { data: prods, error: errProds } = await supa
-      .from("produtos")
-      .select("id, nome, inventario_id, estoque_qtd")
-      .in("id", prodIds);
-
-    // ── Se a query falhou, reporta em vez de mentir "ok: true" ──
-    if (errProds) {
-      falhas.push({ tipo: "query_produtos", motivo: errProds.message });
-      return { ok: false, falhas };
-    }
-    if (!prods?.length) {
-      // Pode acontecer se os produtos foram deletados entre o pedido e a baixa.
-      // Não é grave — só sinaliza.
-      falhas.push({
-        tipo: "produtos_nao_encontrados",
-        motivo: `Nenhum produto encontrado para IDs: ${prodIds.join(", ")}`,
-      });
-      return { ok: false, falhas };
-    }
-
-    const getQtd = (item) => {
-      const q = item.qtd ?? item.q ?? item.quantidade ?? 1;
-      return parseInt(q) || 1;
-    };
-
-    const qtdVendidaPorProduto = {};
-    itens.forEach((item) => {
-      const pid = Number(item.produto_id ?? item.id);
-      if (!Number.isInteger(pid) || pid <= 0) return; // ← pula extras
-      qtdVendidaPorProduto[pid] = (qtdVendidaPorProduto[pid] || 0) + getQtd(item);
-    });
-
-    // ── Caminho 1: produtos com inventario_id ────────────────────────────
-    const descontosInventario = {};
-    prods.forEach((prod) => {
-      if (!prod.inventario_id) return;
-      const qtd = qtdVendidaPorProduto[prod.id];
-      if (!qtd) return;
-      descontosInventario[prod.inventario_id] =
-        (descontosInventario[prod.inventario_id] || 0) + qtd;
-    });
-
-    if (Object.keys(descontosInventario).length > 0) {
-      const invIds = Object.keys(descontosInventario).map(Number);
-      const { data: estoques, error: errEst } = await supa
-        .from("inventario").select("id, quantidade").in("id", invIds);
-      if (errEst) {
-        falhas.push({ tipo: "query_inventario", motivo: errEst.message });
-      } else {
-        for (const est of estoques || []) {
-          // quantidade é numeric — mantém precisão, não trunca
-          const nova = Math.max(0, Number(est.quantidade ?? 0) - descontosInventario[est.id]);
-          const { data: _rows, error: _err } = await supa
-            .from("inventario").update({ quantidade: nova })
-            .eq("id", est.id).select("id");
-          if (_err || !_rows?.length) {
             falhas.push({
-              tipo: "inventario",
-              id: est.id,
+              tipo: "inventario", id: est.id,
               motivo: _err?.message || "0 linhas afetadas",
             });
           } else {
             await supa.from("inventario_movimentos").insert([{
               inventario_id: est.id,
               tipo: "sub",
-              quantidade: descontosInventario[est.id],
+              quantidade: descontosInv[est.id],
               motivo: pedidoId ? `Venda — Pedido #${pedidoId}` : "Venda PDV",
               usuario_email: "sistema",
             }]).then(() => {}).catch(() => {});
@@ -15012,35 +15632,63 @@ async function _descontarEstoqueVenda(pedidoId, itensDireto) {
       }
     }
 
-    // ── Caminho 2: estoque_qtd direto no produto ─────────────────────────
-    const produtosComEstoqueQtd = prods.filter(
-      (p) => p.estoque_qtd !== null && p.estoque_qtd !== undefined
+    // Caminho 2: estoque_qtd direto → RPC atômica
+    const produtosComEstoqueQtd = prodsParaDescontar.filter(
+      (p) => p.estoque_qtd !== null && p.estoque_qtd !== undefined,
     );
-    for (const prod of produtosComEstoqueQtd) {
-      const qtdVendida = qtdVendidaPorProduto[prod.id];
-      if (!qtdVendida) continue;
-      const novaQtd = Math.max(0, (prod.estoque_qtd || 0) - qtdVendida);
-      const updatePayload = { estoque_qtd: novaQtd };
-      if (novaQtd === 0) updatePayload.ativo = false; // auto-pause
 
-      const { data: _rows, error: _err } = await supa
-        .from("produtos").update(updatePayload)
-        .eq("id", prod.id).select("id");
-      if (_err || !_rows?.length) {
+    for (const prod of produtosComEstoqueQtd) {
+      const qtdVendida = qtdVendidaPorProdutoMapa(itens, prod.id);
+      if (!qtdVendida) continue;
+
+      const { data: rpc, error: rpcErr } = await supa
+        .rpc("descontar_estoque_atomico", {
+          p_produto_id: prod.id,
+          p_qtd: qtdVendida,
+        });
+
+      if (rpcErr) {
+        console.warn(
+          `[Estoque] RPC falhou para #${prod.id}, caindo p/ UPDATE direto:`,
+          rpcErr.message,
+        );
+        const { data: fresh } = await supa
+          .from("produtos").select("estoque_qtd").eq("id", prod.id).single();
+        const atual = fresh?.estoque_qtd ?? prod.estoque_qtd;
+        const novaQtd = Math.max(0, atual - qtdVendida);
+        const updatePayload = { estoque_qtd: novaQtd };
+        if (novaQtd === 0) updatePayload.ativo = false;
+
+        const { data: _rows, error: _err } = await supa
+          .from("produtos").update(updatePayload)
+          .eq("id", prod.id).select("id");
+        if (_err || !_rows?.length) {
+          falhas.push({
+            tipo: "produto", id: prod.id, nome: prod.nome,
+            motivo: _err?.message || "0 linhas afetadas",
+          });
+        }
+      } else if (rpc && rpc[0] && !rpc[0].sucesso) {
         falhas.push({
-          tipo: "produto",
-          id: prod.id,
-          nome: prod.nome,
-          motivo: _err?.message || "0 linhas afetadas",
+          tipo: "produto", id: prod.id, nome: prod.nome,
+          motivo: rpc[0].motivo || "RPC retornou sucesso=false",
         });
       }
     }
 
-    const total = Object.keys(descontosInventario).length + produtosComEstoqueQtd.length;
+    // ── Log final ────────────────────────────────────────────────
+    const total = Object.keys(descontosInv).length +
+                  Object.keys(qtdPorVariacao).length +
+                  produtosComEstoqueQtd.length;
+
     if (falhas.length) {
-      console.error(`❌ Falha ao descontar estoque — pedido ${pedidoId || "(PDV)"}:`, falhas);
+      console.error(
+        `❌ Falha ao descontar estoque — pedido ${pedidoId || "(PDV)"}:`, falhas,
+      );
     } else {
-      console.log(`✅ Estoque descontado: pedido ${pedidoId || "(PDV)"}, ${total} item(s)`);
+      console.log(
+        `✅ Estoque descontado: pedido ${pedidoId || "(PDV)"}, ${total} item(s)`,
+      );
     }
     return { ok: falhas.length === 0, falhas };
   } catch (e) {
@@ -15057,10 +15705,7 @@ async function _reporEstoqueCancelamento(pedidoId) {
   const falhas = [];
   try {
     const { data: pedido } = await supa
-      .from("pedidos")
-      .select("itens")
-      .eq("id", pedidoId)
-      .single();
+      .from("pedidos").select("itens").eq("id", pedidoId).single();
     const itens = pedido?.itens;
     if (!itens?.length) return { ok: true, falhas };
 
@@ -15071,115 +15716,138 @@ async function _reporEstoqueCancelamento(pedidoId) {
           .filter((id) => Number.isInteger(id) && id > 0)
       ),
     ];
-    if (!prodIds.length) return { ok: true, falhas };
+    const varIds = [
+      ...new Set(
+        itens
+          .map((i) => Number(i.variacao_id))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      ),
+    ];
 
-    const qtdPorProduto = {};
-    itens.forEach((item) => {
-      const pid = Number(item.produto_id || item.id);
-      if (!Number.isInteger(pid) || pid <= 0) return;
-      qtdPorProduto[pid] = (qtdPorProduto[pid] || 0) + (item.qtd || item.q || 1);
-    });
-
-    // ── 🔧 CORREÇÃO: query que estava FALTANDO (era a causa do
-    //    erro "prods is not defined"). Precisa vir ANTES do uso de `prods`. ──
-    const { data: prods, error: errProds } = await supa
-      .from("produtos")
-      .select("id, nome, inventario_id, estoque_qtd, ativo")
-      .in("id", prodIds);
+    // Busca produtos e variações
+    const [{ data: prods, error: errProds }, { data: variacoes }] =
+      await Promise.all([
+        prodIds.length
+          ? supa.from("produtos")
+              .select("id, nome, inventario_id, estoque_qtd, ativo")
+              .in("id", prodIds)
+          : Promise.resolve({ data: [] }),
+        varIds.length
+          ? supa.from("produto_variacoes")
+              .select("id, nome, estoque_qtd, controlar_estoque")
+              .in("id", varIds)
+          : Promise.resolve({ data: [] }),
+      ]);
 
     if (errProds) {
       falhas.push({ tipo: "query_produtos", motivo: errProds.message });
       return { ok: false, falhas };
     }
-    if (!prods?.length) {
-      falhas.push({
-        tipo: "produtos_nao_encontrados",
-        motivo: `IDs: ${prodIds.join(", ")}`,
-      });
-      return { ok: false, falhas };
-    }
-    // ─────────────────────────────────────────────────────────────
 
-    // ── Caminho 1: inventario_id ──────────────────────────────────────
+    const getQtd = (item) =>
+      parseInt(item.qtd ?? item.q ?? item.quantidade ?? 1) || 1;
+
+    // ── 1. Repõe variações ─────────────────────────────────────
+    const mapaVariacoes = {};
+    (variacoes || []).forEach((v) => { mapaVariacoes[v.id] = v; });
+
+    const qtdPorVariacao = {};
+    itens.forEach((item) => {
+      const vid = Number(item.variacao_id);
+      if (!Number.isInteger(vid) || vid <= 0) return;
+      qtdPorVariacao[vid] = (qtdPorVariacao[vid] || 0) + getQtd(item);
+    });
+
+    for (const [vid, qtd] of Object.entries(qtdPorVariacao)) {
+      const v = mapaVariacoes[vid];
+      if (!v) {
+        falhas.push({ tipo: "variacao", id: vid, motivo: "Variação não encontrada" });
+        continue;
+      }
+      if (v.controlar_estoque === false) continue;
+
+      const { data: fresh } = await supa
+        .from("produto_variacoes").select("estoque_qtd").eq("id", vid).single();
+      const atual = fresh?.estoque_qtd ?? v.estoque_qtd ?? 0;
+      const { data: _r, error: _e } = await supa
+        .from("produto_variacoes")
+        .update({ estoque_qtd: atual + qtd })
+        .eq("id", vid).select("id");
+      if (_e || !_r?.length) {
+        falhas.push({
+          tipo: "variacao", id: vid, nome: v.nome,
+          motivo: _e?.message || "0 linhas afetadas",
+        });
+      }
+    }
+
+    // ── 2. Repõe produtos (sem variação) ───────────────────────
+    const qtdPorProduto = {};
+    itens.forEach((item) => {
+      if (Number(item.variacao_id) > 0) return;
+      const pid = Number(item.produto_id || item.id);
+      if (!Number.isInteger(pid) || pid <= 0) return;
+      qtdPorProduto[pid] = (qtdPorProduto[pid] || 0) + getQtd(item);
+    });
+
+    // Caminho inventario
     const reposicoes = {};
-    prods.forEach((prod) => {
+    (prods || []).forEach((prod) => {
       if (!prod.inventario_id) return;
       const qtd = qtdPorProduto[prod.id];
       if (!qtd) return;
-      reposicoes[prod.inventario_id] =
-        (reposicoes[prod.inventario_id] || 0) + qtd;
+      reposicoes[prod.inventario_id] = (reposicoes[prod.inventario_id] || 0) + qtd;
     });
 
     if (Object.keys(reposicoes).length > 0) {
       const invIds = Object.keys(reposicoes).map(Number);
       const { data: estoques } = await supa
-        .from("inventario")
-        .select("id, quantidade")
-        .in("id", invIds);
+        .from("inventario").select("id, quantidade").in("id", invIds);
       for (const est of estoques || []) {
-        const nova = (est.quantidade ?? 0) + reposicoes[est.id];
-        const { data: _rowsInv, error: _errInv } = await supa
-          .from("inventario")
-          .update({ quantidade: nova })
-          .eq("id", est.id)
-          .select("id");
-        if (_errInv || !_rowsInv?.length) {
+        const nova = (Number(est.quantidade) || 0) + reposicoes[est.id];
+        const { data: _r, error: _e } = await supa
+          .from("inventario").update({ quantidade: nova })
+          .eq("id", est.id).select("id");
+        if (_e || !_r?.length) {
           falhas.push({
-            tipo: "inventario",
-            id: est.id,
-            motivo:
-              _errInv?.message || "0 linhas afetadas (possível bloqueio de RLS)",
+            tipo: "inventario", id: est.id,
+            motivo: _e?.message || "0 linhas afetadas",
           });
+        } else {
+          await supa.from("inventario_movimentos").insert([{
+            inventario_id: est.id,
+            tipo: "ajuste",
+            quantidade: reposicoes[est.id],
+            motivo: `Cancelamento — Pedido #${pedidoId}`,
+            usuario_email: "sistema",
+          }]).then(() => {}).catch(() => {});
         }
-        await supa
-          .from("inventario_movimentos")
-          .insert([
-            {
-              inventario_id: est.id,
-              tipo: "ajuste",
-              quantidade: reposicoes[est.id],
-              motivo: `Cancelamento — Pedido #${pedidoId}`,
-              usuario_email: "sistema",
-            },
-          ])
-          .then(() => {})
-          .catch(() => {});
       }
     }
 
-    // ── Caminho 2: estoque_qtd direto no produto ─────────────────────
-    const produtosComEstoqueQtd = prods.filter(
+    // Caminho estoque_qtd
+    const prodsComEstoque = (prods || []).filter(
       (p) => p.estoque_qtd !== null && p.estoque_qtd !== undefined,
     );
-    for (const prod of produtosComEstoqueQtd) {
+    for (const prod of prodsComEstoque) {
       const qtd = qtdPorProduto[prod.id];
       if (!qtd) continue;
       const novaQtd = (prod.estoque_qtd || 0) + qtd;
       const updatePayload = { estoque_qtd: novaQtd };
-      // 🔧 Reativa automaticamente: se o produto tinha sido pausado por
-      // ter zerado (auto-pause) e agora volta a ter estoque > 0 por causa
-      // do cancelamento, ele deve reaparecer na loja.
       if (novaQtd > 0 && prod.ativo === false) updatePayload.ativo = true;
-      const { data: _rowsProd, error: _errProd } = await supa
-        .from("produtos")
-        .update(updatePayload)
-        .eq("id", prod.id)
-        .select("id");
-      if (_errProd || !_rowsProd?.length) {
+      const { data: _r, error: _e } = await supa
+        .from("produtos").update(updatePayload).eq("id", prod.id).select("id");
+      if (_e || !_r?.length) {
         falhas.push({
-          tipo: "produto",
-          id: prod.id,
-          nome: prod.nome,
-          motivo:
-            _errProd?.message || "0 linhas afetadas (possível bloqueio de RLS)",
+          tipo: "produto", id: prod.id, nome: prod.nome,
+          motivo: _e?.message || "0 linhas afetadas",
         });
       }
     }
 
     if (falhas.length) {
       console.error(
-        `❌ Falha ao repor estoque — pedido cancelado #${pedidoId}:`,
-        falhas,
+        `❌ Falha ao repor estoque — pedido cancelado #${pedidoId}:`, falhas,
       );
     } else {
       console.log(`✅ Estoque reposto: pedido cancelado #${pedidoId}`);
@@ -18763,6 +19431,8 @@ function _injetarBadgeNoMenuPDV() {
  * Consulta o banco e atualiza, de uma só vez:
  *   - o card de alerta no topo da aba PDV
  *   - o badge numérico no ícone do menu lateral
+ *   - TOCA O ALARME quando um novo pedido chega e o usuário
+ *     está na aba PDV (junto com o aviso visual)
  *
  * Chamada em 3 momentos:
  *   1. Ao abrir a aba PDV (carregarPDV)
@@ -18785,6 +19455,35 @@ async function _atualizarBadgePedidosPendentes() {
 
   const n = count || 0;
 
+  // ══════════════════════════════════════════════════════════════
+  //  🔔 ALERTA SONORO no PDV
+  //  Toca o alarme quando o número de pedidos pendentes AUMENTOU
+  //  e o operador está na aba PDV. Usa a mesma campainha da aba
+  //  Pedidos (`tocarAlarme`) — chamada idempotente: se já estiver
+  //  tocando, o `tocarAlarme()` retorna sem duplicar.
+  //
+  //  O realtime já dispara `tocarAlarme()` em INSERTs, mas esta
+  //  verificação por contagem é um backup que garante o som mesmo
+  //  quando o canal Realtime falha ou está reconectando.
+  // ══════════════════════════════════════════════════════════════
+  const _countAnterior = window._pdvUltimoCountPendentes;
+  const _incrementou =
+    typeof _countAnterior === "number" &&
+    _countAnterior >= 0 &&
+    n > _countAnterior;
+
+  window._pdvUltimoCountPendentes = n;
+
+  if (_incrementou) {
+    const _abaAtual = localStorage.getItem("app_lastTab");
+    // Só toca se o operador está no PDV — nas outras abas o realtime
+    // já cuida, e evita-se som duplicado fora de contexto.
+    if (_abaAtual === "pdv" && typeof tocarAlarme === "function") {
+      console.log(`[PDV] 🔔 Novo pedido pendente (${_countAnterior} → ${n}) — tocando alarme`);
+      tocarAlarme();
+    }
+  }
+
   // ── 1. Badge do menu lateral ──────────────────────────────────
   const badgeMenu = document.getElementById("menu-pdv-badge");
   if (badgeMenu) {
@@ -18797,9 +19496,9 @@ async function _atualizarBadgePedidosPendentes() {
   }
 
   // ── 2. Card de alerta dentro da aba PDV ───────────────────────
-  const card = document.getElementById("pdv-alerta-pedidos");
+  const card   = document.getElementById("pdv-alerta-pedidos");
   const titulo = document.getElementById("pdv-alerta-titulo");
-  const sub = document.getElementById("pdv-alerta-sub");
+  const sub    = document.getElementById("pdv-alerta-sub");
 
   if (card) {
     if (n > 0) {
@@ -18812,8 +19511,7 @@ async function _atualizarBadgePedidosPendentes() {
             : "pedidos aguardando aceitação");
       }
       if (sub) {
-        sub.innerHTML =
-          "Clique para revisar e confirmar os pedidos do app.";
+        sub.innerHTML = "Clique para revisar e confirmar os pedidos do app.";
       }
       card.style.display = "flex";
     } else {
