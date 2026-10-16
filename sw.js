@@ -4,7 +4,7 @@
 //    1. Incremente CACHE_NAME (ex: v7, v8…)
 //    2. O SW antigo detecta a diferença no activate e apaga os caches velhos.
 // ─────────────────────────────────────────────────────────────
-const CACHE_NAME = "minimarketbr-v1.7"; // ← bump aqui a cada deploy
+const CACHE_NAME = "minimarketbr-v1.8"; // ← bump aqui a cada deploy
 
 const BLOCKED_ORIGINS = [
   "instagram.",
@@ -24,8 +24,9 @@ const ASSETS_TO_CACHE = [
   "/app.js",
   "/style.css",
   "/supabaseClient.js",
-  "/freteUtils.js",      // ← NOVO
-  "/varejoUtils.js",     // ← NOVO
+  "/varejoUtils.js",        // ← ADICIONADO
+  "/freteUtils.js",         // ← ADICIONADO
+  "/translations.js",       // ← ADICIONADO
   "/turnos.html",
   "/ficha-tecnica.js",
   "/estatisticas.js",
@@ -48,9 +49,10 @@ const NETWORK_FIRST = [
   "/filiais.js",
   "/mensalistas.js",
   "/supabaseClient.js",
-  "/freteUtils.js",      // ← NOVO
-  "/varejoUtils.js",     // ← NOVO
   "/style.css",
+  "/varejoUtils.js",        // ← ADICIONADO — crítica para o app
+  "/freteUtils.js",         // ← ADICIONADO — crítica para o app
+  "/translations.js",       // ← ADICIONADO — crítica para o app
 ];
 
 self.addEventListener("install", (event) => {
