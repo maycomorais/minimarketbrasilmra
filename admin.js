@@ -134,6 +134,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       adminMaster: "🎮 ADMIN MASTER",
       dono: "🔑 DONO",
       gerente: "👔 GERENTE",
+      socio: "🤝 SÓCIO",
       funcionario: "👷 FUNCIONÁRIO",
       garcom: "🍽️ GARÇOM",
     };
@@ -143,6 +144,11 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     // Carrega features e aplica visibilidade das abas
     await _carregarFeaturesGlobais();
+
+    // Sócio: carrega suas permissões individuais ANTES de aplicar visibilidade
+    if (perfilUsuario === "socio") {
+      await _carregarPermissoesSocio();
+    }
 
     // Atualiza brand com nome do restaurante (carregado em _carregarFeaturesGlobais)
     const elBrand = document.getElementById("brand-text");
@@ -612,6 +618,40 @@ function _aplicarFormasPagamentoPDV(features) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+//  Permissões do perfil Sócio (cache em memória)
+//  Formato do cache: { abas: ["dashboard","pdv",...] }
+//  Populado por _carregarPermissoesSocio() no boot do painel.
+// ─────────────────────────────────────────────────────────────
+let _permissoesSocio = null;
+
+/**
+ * Consulta o banco e cacheia a lista de abas que o Sócio
+ * logado pode ver. Chamar 1x no boot do painel.
+ * Usa a RPC get_minhas_abas() que já resolve:
+ *   - adminMaster/dono → todas as abas
+ *   - socio → apenas permissoes_customizadas.abas
+ *   - demais → todas (features_ativas filtra no front)
+ */
+async function _carregarPermissoesSocio() {
+  try {
+    const { data, error } = await supa.rpc("get_minhas_abas");
+    if (error) {
+      console.warn("[Sócio] RPC get_minhas_abas falhou:", error.message);
+      _permissoesSocio = { abas: [] };  // nega tudo por padrão
+      return;
+    }
+    _permissoesSocio = {
+      abas: Array.isArray(data) ? data : [],
+    };
+    console.log("[Sócio] Permissões carregadas:", _permissoesSocio.abas);
+  } catch (e) {
+    console.warn("[Sócio] Erro ao carregar permissões:", e.message);
+    _permissoesSocio = { abas: [] };
+  }
+}
+
+
 function _feat(categoria, chave) {
   if (!FEATURES_ATIVAS) return true; // sem config = tudo ativo
   const cat = FEATURES_ATIVAS[categoria];
@@ -621,28 +661,53 @@ function _feat(categoria, chave) {
 
 function _aplicarVisibilidadeAbas() {
   const mapa = {
-    "menu-pedidos": "pedidos",
-    "menu-cozinha": "cozinha",
-    "menu-pdv": "pdv",
-    "menu-financeiro": "financeiro",
-    "menu-inventario": "inventario",
-    "menu-equipe": "equipe",
-    "menu-configuracoes": "configuracoes",
-    "menu-dashboard": "dashboard",
-    "menu-estatisticas": "estatisticas",
-    "menu-ficha-tecnica": "ficha-tecnica",
-    "menu-crm": "crm",
-    "menu-turnos": "turnos",
-    "menu-produtos": "produtos",
+    "menu-pedidos":        "pedidos",
+    "menu-cozinha":        "cozinha",
+    "menu-pdv":            "pdv",
+    "menu-financeiro":     "financeiro",
+    "menu-inventario":     "inventario",
+    "menu-equipe":         "equipe",
+    "menu-configuracoes":  "configuracoes",
+    "menu-dashboard":      "dashboard",
+    "menu-estatisticas":   "estatisticas",
+    "menu-ficha-tecnica":  "ficha-tecnica",
+    "menu-crm":            "crm",
+    "menu-turnos":         "turnos",
+    "menu-produtos":       "produtos",
+    "menu-mensalistas":    "mensalistas",
+    "menu-filiais":        "filiais",
   };
-  // Só aplica restrições para cargos abaixo de adminMaster
+
+  // adminMaster: vê tudo, ignora features e permissões
   if (perfilUsuario === "adminMaster") return;
+
+  // ── Sócio: aplica DOIS filtros em conjunto ────────────────
+  //  1. features_ativas (bloqueio global da loja)
+  //  2. permissoes_customizadas.abas (bloqueio individual do sócio)
+  if (perfilUsuario === "socio") {
+    const permitidas = _permissoesSocio?.abas || [];
+
+    Object.entries(mapa).forEach(([menuId, chave]) => {
+      const el = document.getElementById(menuId);
+      if (!el) return;
+
+      const bloqueadoPorFeature = !_feat("tabs", chave);
+      const naoPermitidoAoSocio  = !permitidas.includes(chave);
+
+      if (bloqueadoPorFeature || naoPermitidoAoSocio) {
+        el.style.display = "none";
+      }
+    });
+    return;
+  }
+
+  // ── Demais cargos (gerente/funcionario/garcom) ────────────
+  //  Só o filtro global de features_ativas se aplica
   Object.entries(mapa).forEach(([menuId, chave]) => {
     const el = document.getElementById(menuId);
     if (el && !_feat("tabs", chave)) el.style.display = "none";
   });
 }
-
 // Salva features (adminMaster only)
 async function salvarFeatures() {
   if (perfilUsuario !== "adminMaster") return alert(t("alert.acesso_negado"));
@@ -2350,12 +2415,23 @@ if (_sessaoCaixaAtiva) {
       });
     }
     let custoTotal = 0;
-    peds.forEach((p) => {
+        peds.forEach((p) => {
       (p.itens || []).forEach((i) => {
         const pid = Number(i.produto_id || i.id || i.pid || 0);
         const qtd = i.qtd || i.q || 1;
         const precoVenda = safeNum(i.preco || i.p || 0);
-        const precoCompra = precosCompra[pid] || 0;
+        const precoCompraKg = precosCompra[pid] || 0;
+
+        // 🔧 Item vendido por peso: `preco` já é o TOTAL cobrado
+        // (preco_kg × peso_gramas / 1000), mas `preco_compra` é por kg.
+        // Precisa converter o custo para a mesma fração de peso antes
+        // de subtrair — senão o lucro vira um prejuízo fictício.
+        const _isItemKg = i._isKg === true || Number(i.peso_gramas) > 0;
+        const _fracaoKg = _isItemKg
+          ? Number(i.peso_gramas || 0) / 1000
+          : 1;
+        const precoCompra = precoCompraKg * _fracaoKg;
+
         const valorItem = precoVenda * qtd;
         if (precoVenda > 0 && precoCompra > 0) {
           lucroBrutoVendas += (precoVenda - precoCompra) * qtd;
@@ -3443,11 +3519,11 @@ async function _calcularResumoSessao(sessaoId, inicioISO, fimISO) {
     );
   };
 
-  // ── 1. Busca em paralelo ────────────────────────────────────────
+    // ── 1. Busca em paralelo ────────────────────────────────────────
   const [
     { data: rows, error },
-    { data: pedidosBrutos },
-    { data: movs },
+    { data: pedidosBrutos, error: errPedidos },
+    { data: movs, error: errMovs },
   ] = await Promise.all([
     supa.from("vw_sessao_resumo").select("*").eq("sessao_id", sessaoId).limit(1),
     supa
@@ -3465,6 +3541,23 @@ async function _calcularResumoSessao(sessaoId, inicioISO, fimISO) {
       .select("tipo, valor, tipo_despesa, descricao_outro")
       .eq("sessao_id", sessaoId),
   ]);
+
+  // 🔧 Antes, erros em pedidos/movs eram silenciados e o fechamento
+  //    saía zerado sem aviso. Agora: loga + avisa o operador.
+  if (errPedidos) {
+    console.error("[Fechamento] Erro ao buscar pedidos:", errPedidos.message);
+    alert(
+      "⚠️ Não foi possível buscar os pedidos desta sessão.\n\n" +
+      "Motivo: " + errPedidos.message + "\n\n" +
+      "O fechamento será exibido, mas os valores podem estar zerados."
+    );
+  }
+  if (errMovs) {
+    console.error("[Fechamento] Erro ao buscar movimentações:", errMovs.message);
+  }
+  if (error) {
+    console.warn("[Fechamento] View vw_sessao_resumo falhou:", error.message);
+  }
 
   const peds = pedidosBrutos || [];
   const movsArr = movs || [];
@@ -11432,11 +11525,11 @@ function _mostrarModalPesoPDV(produto, precoKg) {
       <label style="font-size:0.8rem;font-weight:700;color:#555;display:block;margin-bottom:6px">
         Digite o peso em gramas:
       </label>
-      <div style="display:flex;align-items:center;gap:8px">
+      <div style="display:flex;align-items:center;gap:8px;width:100%">
         <input type="number" id="_kg-input-g" min="1" step="1" placeholder="Ex: 300"
-          style="flex:1;font-size:1.5rem;font-weight:700;padding:10px 14px;border:2px solid #0891b2;border-radius:10px;text-align:center;color:#0891b2;outline:none"
+          style="flex:1 1 auto;min-width:0;box-sizing:border-box;width:100%;font-size:1.5rem;font-weight:700;padding:10px 14px;border:2px solid #0891b2;border-radius:10px;text-align:center;color:#0891b2;outline:none;-moz-appearance:textfield"
           oninput="_kgAtualizarPreview()" onkeydown="if(event.key==='Enter')_kgConfirmar()">
-        <span style="font-size:1rem;font-weight:700;color:#888;white-space:nowrap">g</span>
+        <span style="font-size:1rem;font-weight:700;color:#888;white-space:nowrap;flex-shrink:0">g</span>
       </div>
       <div style="font-size:0.73rem;color:#888;margin-top:4px;text-align:center">
         Acima de 1000g é convertido automaticamente para kg
@@ -13620,10 +13713,19 @@ async function amCarregarUsuarios() {
             `<option value="${c}" ${u.cargo === c ? "selected" : ""}>${c}</option>`,
         )
         .join("");
+            const btnPermissoes = u.cargo === "socio"
+        ? `<button onclick="amAbrirModalPermissoes('${u.id}','${u.email.replace(/'/g, "\\'")}')"
+            style="background:#8e44ad;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:0.8rem;margin-right:6px"
+            title="Editar abas visíveis">
+            🔐 Permissões
+          </button>`
+        : "";
+
       const acoes =
         isMe || isAM
           ? '<span style="color:#aaa;font-size:0.78rem">—</span>'
           : `
+      ${btnPermissoes}
       <select onchange="amAlterarCargo('${u.id}', this.value)" style="padding:4px 8px;border-radius:6px;border:1px solid #ddd;font-size:0.8rem;margin-right:6px">
         ${opcoesCargo}
       </select>
@@ -13657,6 +13759,170 @@ async function amAlterarCargo(id, novoCargo) {
     carregarEquipe();
   }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Admin Master — Editor de permissões do Sócio
+//  Modal dinâmico: 1 checkbox por aba. Salva em
+//  perfis_acesso.permissoes_customizadas = { abas: [...] }
+// ─────────────────────────────────────────────────────────────
+const _ABAS_DISPONIVEIS = [
+  { key: "dashboard",     label: "📊 Visão Geral" },
+  { key: "pdv",           label: "🏪 PDV Mostrador" },
+  { key: "pedidos",       label: "📋 Pedidos" },
+  { key: "cozinha",       label: "🍳 Separação" },
+  { key: "equipe",        label: "👥 Equipe" },
+  { key: "produtos",      label: "🍽️ Produtos" },
+  { key: "categorias",    label: "🏷️ Categorias" },
+  { key: "motoboys",      label: "🏍️ Motoboys" },
+  { key: "financeiro",    label: "💰 Financeiro" },
+  { key: "inventario",    label: "📦 Inventário" },
+  { key: "configuracoes", label: "⚙️ Configurações" },
+  { key: "estatisticas",  label: "📈 Estatísticas" },
+  { key: "ficha-tecnica", label: "🧮 Ficha Técnica" },
+  { key: "crm",           label: "👥 CRM Clientes" },
+  { key: "mensalistas",   label: "📆 Mensalistas" },
+  { key: "filiais",       label: "🏬 Filiais" },
+];
+
+async function amAbrirModalPermissoes(userId, userEmail) {
+  if (perfilUsuario !== "adminMaster") return;
+
+  // Busca permissões atuais
+  const { data, error } = await supa
+    .from("perfis_acesso")
+    .select("permissoes_customizadas, nome_display")
+    .eq("id", userId)
+    .single();
+
+  if (error || !data) {
+    alert("Erro ao carregar permissões: " + (error?.message || "usuário não encontrado"));
+    return;
+  }
+
+  const atuais = data.permissoes_customizadas?.abas || [];
+  const nomeExibir = data.nome_display || userEmail;
+
+  document.getElementById("_modal-perm-socio")?.remove();
+
+  const overlay = document.createElement("div");
+  overlay.id = "_modal-perm-socio";
+  overlay.style.cssText = [
+    "position:fixed","inset:0","background:rgba(0,0,0,0.6)",
+    "z-index:99999","display:flex","align-items:center",
+    "justify-content:center","padding:16px","overflow-y:auto",
+  ].join(";");
+  overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+  overlay.innerHTML = `
+    <div style="background:#fff;border-radius:18px;max-width:560px;width:100%;
+                max-height:92vh;overflow:hidden;display:flex;flex-direction:column;
+                box-shadow:0 24px 80px rgba(0,0,0,0.4)">
+      <div style="background:linear-gradient(135deg,#1e40af,#1e3a8a);color:#fff;
+                  padding:20px 24px;flex-shrink:0">
+        <div style="font-size:1.15rem;font-weight:800">🔐 Permissões do Sócio</div>
+        <div style="font-size:0.82rem;opacity:0.9;margin-top:4px">
+          <b>${nomeExibir}</b> — marque as abas que ele pode ver
+        </div>
+      </div>
+
+      <div style="padding:20px 24px;overflow-y:auto;flex:1">
+        <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+          <button type="button" onclick="_permMarcarTodas(true)"
+            style="padding:6px 14px;background:#e0f2fe;color:#0369a1;border:1px solid #7dd3fc;
+                   border-radius:8px;font-weight:700;font-size:0.78rem;cursor:pointer">
+            ✓ Marcar todas
+          </button>
+          <button type="button" onclick="_permMarcarTodas(false)"
+            style="padding:6px 14px;background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;
+                   border-radius:8px;font-weight:700;font-size:0.78rem;cursor:pointer">
+            ✗ Limpar todas
+          </button>
+        </div>
+
+        <div id="_perm-checkboxes" style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+          ${_ABAS_DISPONIVEIS.map((a) => `
+            <label style="display:flex;align-items:center;gap:8px;padding:8px 12px;
+                          background:#f8fafc;border:1.5px solid #e2e8f0;border-radius:10px;
+                          cursor:pointer;font-size:0.85rem;font-weight:600;color:#334155;
+                          transition:all .15s"
+              onmouseover="this.style.borderColor='#8e44ad'"
+              onmouseout="this.style.borderColor='#e2e8f0'">
+              <input type="checkbox" class="_perm-chk" value="${a.key}"
+                ${atuais.includes(a.key) ? "checked" : ""}
+                style="width:17px;height:17px;accent-color:#8e44ad;flex-shrink:0">
+              ${a.label}
+            </label>
+          `).join("")}
+        </div>
+
+        <div style="margin-top:18px;padding:12px 14px;background:#fffbeb;
+                    border:1px solid #fcd34d;border-radius:10px;font-size:0.78rem;color:#92400e">
+          ⚠️ <b>Admin Master</b> e <b>Assinatura</b> são sempre exclusivos do adminMaster —
+          mesmo que você marque, o Sócio não verá essas abas.
+        </div>
+      </div>
+
+      <div style="padding:16px 24px;border-top:1px solid #f0f0f0;background:#fafafa;
+                  display:flex;gap:10px;flex-shrink:0">
+        <button type="button" onclick="document.getElementById('_modal-perm-socio').remove()"
+          style="flex:1;padding:12px;background:#fff;color:#64748b;border:1.5px solid #e2e8f0;
+                 border-radius:10px;font-weight:700;font-size:0.88rem;cursor:pointer">
+          Cancelar
+        </button>
+        <button type="button" id="_perm-btn-salvar"
+          onclick="amSalvarPermissoes('${userId}')"
+          style="flex:2;padding:12px;background:linear-gradient(135deg,#8e44ad,#6b21a8);
+                 color:#fff;border:none;border-radius:10px;font-weight:800;font-size:0.9rem;
+                 cursor:pointer;box-shadow:0 4px 14px rgba(142,68,173,0.35)">
+          ✅ Salvar Permissões
+        </button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(overlay);
+
+  // Helper para "marcar/desmarcar todas"
+  window._permMarcarTodas = (valor) => {
+    document.querySelectorAll("._perm-chk").forEach((c) => (c.checked = valor));
+  };
+}
+
+async function amSalvarPermissoes(userId) {
+  if (perfilUsuario !== "adminMaster") return;
+
+  const marcados = Array.from(document.querySelectorAll("._perm-chk:checked"))
+    .map((c) => c.value);
+
+  const btn = document.getElementById("_perm-btn-salvar");
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Salvando..."; }
+
+  const { error } = await supa
+    .from("perfis_acesso")
+    .update({ permissoes_customizadas: { abas: marcados } })
+    .eq("id", userId);
+
+  if (error) {
+    alert("❌ Erro ao salvar: " + error.message);
+    if (btn) { btn.disabled = false; btn.textContent = "✅ Salvar Permissões"; }
+    return;
+  }
+
+  document.getElementById("_modal-perm-socio")?.remove();
+
+  // Toast
+  const toast = document.createElement("div");
+  toast.textContent = `✅ ${marcados.length} aba(s) liberada(s)`;
+  toast.style.cssText = [
+    "position:fixed","bottom:28px","left:50%","transform:translateX(-50%)",
+    "background:#16a34a","color:#fff","padding:12px 24px","border-radius:12px",
+    "font-weight:700","font-size:0.9rem","z-index:99999",
+    "box-shadow:0 8px 24px rgba(0,0,0,0.2)",
+  ].join(";");
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 3000);
+}
+
 
 async function amExcluirUsuario(id, email) {
   if (perfilUsuario !== "adminMaster") return;
