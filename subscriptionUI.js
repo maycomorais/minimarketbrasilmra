@@ -368,6 +368,8 @@ const SubscriptionUI = (() => {
     }
   }
 
+  //
+
   return {
     inicializar,
     renderizarBarra,
