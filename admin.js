@@ -2644,16 +2644,42 @@ async function calcularFinanceiro() {
   const facturaFiltro = elFactura ? elFactura.value : "todos";
 
   // ── 4. Busca pedidos dentro da janela da sessão ───────────────────
-  let query = supa
-    .from("pedidos")
-    .select("*, motoboys(nome)")
-    .neq("status", "cancelado")
-    .or(
-      `and(created_at.gte.${utcI},created_at.lte.${utcF}),and(quitado_em.gte.${utcI},quitado_em.lte.${utcF})`,
-    );
+    // ── 4. Busca pedidos dentro da janela da sessão (COM PAGINAÇÃO) ───────────────────
+  let peds = [];
+  let page = 0;
+  const pageSize = 1000;
+  let temMais = true;
 
-  const { data: pedidos } = await query;
-  let peds = pedidos || [];
+  while (temMais) {
+    const query = supa
+      .from("pedidos")
+      .select("*, motoboys(nome)")
+      .neq("status", "cancelado")
+      .or(
+        `and(created_at.gte.${utcI},created_at.lte.${utcF}),and(quitado_em.gte.${utcI},quitado_em.lte.${utcF})`,
+      )
+      .order("created_at", { ascending: true })
+      .range(page * pageSize, (page + 1) * pageSize - 1);
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error("Erro ao buscar pedidos:", error);
+      break;
+    }
+
+    if (data && data.length > 0) {
+      peds = peds.concat(data);
+      page++;
+      // Se retornou menos de 1000, significa que chegamos no fim da lista
+      if (data.length < pageSize) {
+        temMais = false;
+      }
+    } else {
+      temMais = false;
+    }
+  }
+
 
   // 🚨 O FILTRO MÁGICO DO NA NOTA 🚨
   peds = peds.filter((p) => {
