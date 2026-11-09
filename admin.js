@@ -2678,8 +2678,7 @@ async function calcularFinanceiro() {
     } else {
       temMais = false;
     }
-  }
-
+  };
 
   // 🚨 O FILTRO MÁGICO DO NA NOTA 🚨
   peds = peds.filter((p) => {
@@ -6724,10 +6723,15 @@ async function salvarProduto() {
         ) || 0;
     }
 
-    if (document.getElementById("prod-venda-kg")?.checked) {
-      const pkgVal =
-        parseFloat(document.getElementById("prod-preco-kg")?.value) || 0;
-      if (pkgVal > 0) precoBase = pkgVal;
+    // ── Detecta Venda por Kg ──────────────────────────────────
+    // (precisa vir ANTES de montar montagem_config e do payload)
+    const _vendaKgAtiva =
+      document.getElementById("prod-venda-kg")?.checked === true;
+    const _precoKgVal =
+      parseFloat(document.getElementById("prod-preco-kg")?.value) || 0;
+
+    if (_vendaKgAtiva && _precoKgVal > 0) {
+      precoBase = _precoKgVal;
     }
 
     // ── Promoção ──────────────────────────────────────────────
@@ -6758,14 +6762,25 @@ async function salvarProduto() {
     // ── Faixas de preço (varejo/atacado) ──────────────────────
     const _faixasPreco = _coletarFaixasPreco();
 
-    // Preserva montagem_config existente quando não há faixas ativas.
-    // Sem isso, editar uma pizza/montável/combo sem mexer em faixas
-    // apaga a configuração original do produto.
+    // ── Monta montagem_config com a prioridade correta ────────
+    // 1) Faixas de preço (varejo/atacado) → __tipo: "varejo"
+    // 2) Venda por Kg                     → __tipo: "kg"
+    // 3) Nenhum dos dois → preserva o montagem_config antigo,
+    //    MAS remove __tipo "kg"/"varejo" caso o usuário tenha
+    //    desmarcado essas opções ao editar.
     let _montagemConfig = null;
     if (_faixasPreco) {
       _montagemConfig = { __tipo: "varejo", faixas_preco: _faixasPreco };
+    } else if (_vendaKgAtiva && _precoKgVal > 0) {
+      _montagemConfig = { __tipo: "kg", preco_kg: _precoKgVal };
     } else if (id && _produtosMap[id]?.montagem_config) {
-      _montagemConfig = _produtosMap[id].montagem_config;
+      const _cfgAntigo = _produtosMap[id].montagem_config;
+      const _tipoAntigo =
+        _cfgAntigo && !Array.isArray(_cfgAntigo) ? _cfgAntigo.__tipo : null;
+      // Só preserva se o config antigo NÃO era kg nem varejo
+      if (_tipoAntigo !== "kg" && _tipoAntigo !== "varejo") {
+        _montagemConfig = _cfgAntigo;
+      }
     }
 
     // ── Payload ───────────────────────────────────────────────
@@ -7057,15 +7072,41 @@ async function abrirModalProduto(produto = null, tipoInicial = null) {
     if (_emEl && temEst && produto.estoque_minimo != null)
       _emEl.value = produto.estoque_minimo;
 
-    // Venda por Kg
-    const eKg = produto.unidade_venda === "kg" && produto.preco_kg > 0;
+    // ── Venda por Kg ──────────────────────────────────────────
+    // Fonte de verdade: montagem_config.__tipo === "kg".
+    // Fallback: unidade_venda === "kg" e preco_kg > 0 (compat. com
+    // produtos antigos que só tinham unidade_venda).
+    let _cfgProdKg = produto.montagem_config;
+    if (typeof _cfgProdKg === "string") {
+      try {
+        _cfgProdKg = JSON.parse(_cfgProdKg);
+      } catch (_) {
+        _cfgProdKg = null;
+      }
+    }
+    const _ehKgPorMontagem =
+      _cfgProdKg &&
+      !Array.isArray(_cfgProdKg) &&
+      _cfgProdKg.__tipo === "kg";
+    const _ehKgPorUnidade =
+      produto.unidade_venda === "kg" && produto.preco_kg > 0;
+    const _ehKg = !!(_ehKgPorMontagem || _ehKgPorUnidade);
+
+    // Preço por kg: prioriza o valor salvo dentro do montagem_config,
+    // senão usa o campo legado produto.preco_kg.
+    const _precoKgEdit =
+      _ehKgPorMontagem && _cfgProdKg?.preco_kg
+        ? Number(_cfgProdKg.preco_kg)
+        : produto.preco_kg || 0;
+
     const _vkEl = document.getElementById("prod-venda-kg");
     if (_vkEl) {
-      _vkEl.checked = eKg;
-      toggleVendaKg(eKg);
+      _vkEl.checked = _ehKg;
+      toggleVendaKg(_ehKg);
     }
     const _pkEl = document.getElementById("prod-preco-kg");
-    if (_pkEl && produto.preco_kg) _pkEl.value = produto.preco_kg;
+    if (_pkEl && _precoKgEdit > 0) _pkEl.value = _precoKgEdit;
+
     // ── Perecível ──────────────────────────────────────────
     const _perEl = document.getElementById("prod-perecivel");
     if (_perEl) {
