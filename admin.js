@@ -3659,6 +3659,9 @@ async function carregarRelatorio() {
     cancelado: { bg: "#f8d7da", color: "#721c24", label: "❌ Cancelado" },
   };
 
+  // Variáveis de controle de permissão de cancelamento
+  const _podeCancelRel = typeof _podeCancelarDireto === 'function' ? _podeCancelarDireto() : false;
+
   (pedidos || []).forEach((p) => {
     const sc = scMap[p.status] || {
       bg: "#f0f0f0",
@@ -3666,6 +3669,7 @@ async function carregarRelatorio() {
       label: p.status,
     };
     const isPDV = p.tipo_entrega === "balcao";
+    const jaCancelado = p.status === "cancelado";
 
     const itensList = (p.itens || [])
       .map((i) => {
@@ -3797,6 +3801,28 @@ async function carregarRelatorio() {
       : fmtDiff(p.tempo_recebido, p.tempo_entregue);
 
     const _tz = { timeZone: "America/Asuncion" };
+    
+    // Monta os botões de ação dinamicamente
+    let acoesHtml = `
+      <!-- Botão Editar Pagamento -->
+      <button class="btn btn-sm" onclick="abrirModalEditarPagamento(${p.id})" title="Editar Forma de Pagamento" 
+        style="background:#27ae60; color:#fff; font-size:0.85rem; padding:6px 10px; border-radius:6px; border:none; cursor:pointer;">
+        <i class="fas fa-edit"></i>
+      </button>
+    `;
+
+    // Botão Cancelar (só aparece se tiver permissão e não estiver cancelado)
+    if (!jaCancelado && _podeCancelRel) {
+      acoesHtml += `
+        <button class="btn btn-sm" onclick="cancelarPedidoRelatorio(${p.id})" title="Cancelar Pedido" 
+          style="background:#e74c3c; color:#fff; font-size:0.85rem; padding:6px 10px; border-radius:6px; border:none; cursor:pointer; margin-left:4px;">
+          <i class="fas fa-times"></i>
+        </button>
+      `;
+    } else if (jaCancelado) {
+      acoesHtml += `<div style="font-size:0.7rem; color:#aaa; font-weight:600; margin-top:4px;">Cancelado</div>`;
+    }
+
     tbody.innerHTML += `<tr style="border-bottom:1px solid #eee;vertical-align:top">
       <td style="padding:10px 8px;white-space:nowrap">
         <div style="font-size:1rem;font-weight:700;color:#1a1a2e">#${p.id}</div>
@@ -3821,12 +3847,10 @@ async function carregarRelatorio() {
         ${tlHtml}
         ${totalTime !== "-" ? `<div style="margin-top:5px;padding:3px 7px;background:#f0f4ff;border-radius:6px;font-size:0.75rem;font-weight:700;color:#3a4db7;text-align:center">⏱ ${totalTime}</div>` : ""}
       </td>
-      <td style="padding:10px 8px;white-space:nowrap;text-align:center;min-width:90px">
-        <!-- BOTÃO DE EDITAR PAGAMENTO -->
-        <button class="btn btn-sm" onclick="abrirModalEditarPagamento(${p.id})" title="Editar Forma de Pagamento" 
-          style="background:#27ae60; color:#fff; font-size:0.85rem; padding:6px 12px; border-radius:6px; border:none; cursor:pointer; margin-bottom:4px;">
-          <i class="fas fa-edit"></i>
-        </button>
+      <td style="padding:10px 8px;white-space:nowrap;text-align:center;min-width:100px">
+        <div style="display:flex; flex-direction:column; align-items:center; justify-content:center;">
+          ${acoesHtml}
+        </div>
       </td>
     </tr>`;
   });
