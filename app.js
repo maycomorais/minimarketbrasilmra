@@ -3617,6 +3617,107 @@ function aplicarFreteFixo() {
 // ── Trava global anti-duplo-clique ──────────────────────────────
 let _enviandoPedido = false;
 
+// ── Helpers ─────────────────────────────────────────────────────
+function _hashCurto(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) {
+    h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(36);
+}
+
+function _uuidSimples() {
+  return window.crypto && crypto.randomUUID
+    ? crypto.randomUUID().replace(/-/g, "")
+    : Date.now().toString(36) + Math.random().toString(36).slice(2, 14);
+}
+
+// Modal de erro/aviso DENTRO da página (alert() é suprimido em navegadores
+// internos de Instagram/Facebook/WhatsApp). opts: { retry, msgZap }
+function _mostrarErroPedido(titulo, texto, opts = {}) {
+  const old = document.getElementById("modal-erro-pedido");
+  if (old) old.remove();
+
+  const modal = document.createElement("div");
+  modal.id = "modal-erro-pedido";
+  modal.style.cssText = [
+    "position:fixed;inset:0;z-index:100000",
+    "background:rgba(0,0,0,0.75)",
+    "display:flex;align-items:center;justify-content:center",
+    "padding:20px;box-sizing:border-box",
+  ].join(";");
+  modal.innerHTML = `
+    <div style="background:white;border-radius:20px;padding:26px 22px;max-width:380px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
+      <div style="font-size:2.8rem;margin-bottom:8px">⚠️</div>
+      <h3 id="mep-titulo" style="margin:0 0 8px;font-size:1.15rem;color:#1a1a2e"></h3>
+      <p id="mep-texto" style="margin:0 0 18px;font-size:0.92rem;color:#555;line-height:1.5"></p>
+      <div id="mep-botoes" style="display:flex;flex-direction:column;gap:10px"></div>
+    </div>`;
+  document.body.appendChild(modal);
+  modal.querySelector("#mep-titulo").textContent = titulo;
+  modal.querySelector("#mep-texto").textContent = texto;
+
+  const box = modal.querySelector("#mep-botoes");
+  const estiloBtn =
+    "width:100%;padding:14px;border:none;border-radius:12px;font-size:1rem;font-weight:700;cursor:pointer;text-decoration:none;display:block;box-sizing:border-box;";
+
+  if (opts.retry) {
+    const b = document.createElement("button");
+    b.textContent = "🔄 Tentar novamente";
+    b.style.cssText = estiloBtn + "background:var(--primary);color:#fff;";
+    b.onclick = () => {
+      modal.remove();
+      opts.retry();
+    };
+    box.appendChild(b);
+  }
+  if (opts.msgZap) {
+    const a = document.createElement("a");
+    a.href = `https://wa.me/${FONE_LOJA}?text=${encodeURIComponent(opts.msgZap)}`;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.innerHTML = "📱 Enviar pedido pelo WhatsApp";
+    a.style.cssText = estiloBtn + "background:#25D366;color:#fff;";
+    box.appendChild(a);
+  }
+  const f = document.createElement("button");
+  f.textContent = "Fechar";
+  f.style.cssText = estiloBtn + "background:#eee;color:#333;";
+  f.onclick = () => modal.remove();
+  box.appendChild(f);
+}
+
+// Registra falhas para diagnóstico (nunca quebra o fluxo)
+async function _logFalhaPedido(payload, erro) {
+  try {
+    if (typeof supa === "undefined") return;
+    await supa.from("pedidos_falhas").insert([
+      {
+        payload: payload || null,
+        erro: String(erro || "").slice(0, 1000),
+        user_agent: navigator.userAgent,
+        url: location.href,
+      },
+    ]);
+  } catch (_) {}
+}
+
+function _finalizarPedidoLocal() {
+  carrinho = [];
+  cupomAplicado = null;
+  MODO_AGENDAMENTO = false;
+  DATA_AGENDAMENTO = null;
+  const indicadorAg = document.getElementById("indicador-agendamento");
+  if (indicadorAg) indicadorAg.remove();
+  try {
+    localStorage.removeItem("locanda_carrinho_backup");
+    localStorage.removeItem("locanda_carrinho_backup_time");
+  } catch (e) {}
+  updateUI();
+  fecharCheckout();
+}
+
+// ── Envio do pedido ─────────────────────────────────────────────
 async function enviarZap() {
   if (_enviandoPedido) return;
   _enviandoPedido = true;
@@ -3646,21 +3747,26 @@ async function enviarZap() {
     const tel = document.getElementById("cli-tel").value.trim();
     const pag = document.getElementById("forma-pag").value;
 
+    // ═══ 1. TODAS AS VALIDAÇÕES (sem nenhum efeito colateral) ═══
     if (!nome || !tel || !pag)
-      return alert("Preencha todos os campos obrigatórios!");
+      return _mostrarErroPedido(
+        "Dados incompletos",
+        "Preencha todos os campos obrigatórios!",
+      );
 
-    // Troco obrigatório quando pagamento em Efetivo
     if (pag === "Efetivo") {
       const trocoVal = document.getElementById("troco-valor").value.trim();
       if (!trocoVal || parseFloat(trocoVal.replace(/[^\d]/g, "")) <= 0) {
         document.getElementById("troco-valor").focus();
         document.getElementById("troco-valor").style.borderColor = "#e74c3c";
-        return alert("⚠️ Informe o valor em dinheiro para cálculo do troco!");
+        return _mostrarErroPedido(
+          "Troco",
+          "Informe o valor em dinheiro para cálculo do troco!",
+        );
       }
       document.getElementById("troco-valor").style.borderColor = "";
     }
 
-    // Promoções do dia: bloquear pagamento com Cartão
     const temPromoItem = carrinho.some((item) => {
       for (const key in MENU) {
         if (key === "promocoes_do_dia") {
@@ -3673,33 +3779,17 @@ async function enviarZap() {
       return false;
     });
     if (temPromoItem && pag === "Cartao") {
-      return alert(
-        '⚠️ Produtos da "Promoção do Dia" não aceitam pagamento com Cartão.',
+      return _mostrarErroPedido(
+        "Forma de pagamento",
+        'Produtos da "Promoção do Dia" não aceitam pagamento com Cartão.',
       );
     }
 
-    // Anti-duplicata do lado do cliente: bloqueia reenvio do MESMO carrinho
-    // em até 1h. A chave enviada ao servidor é diferente — esta é só UX.
-    const _agora = Date.now();
-    const _ultimoHash = localStorage.getItem("locanda_last_hash");
-    const _ultimoTs = parseInt(localStorage.getItem("locanda_last_ts") || "0");
-    const _hashAtual = carrinho
-      .map((i) => i.nome + i.qtd)
-      .sort()
-      .join("|");
-    if (_ultimoHash === _hashAtual && _agora - _ultimoTs < 3600000) {
-      return alert(
-        "🚫 Seu pedido anterior foi computado, estamos bloqueando esta segunda tentativa.",
-      );
-    }
-    localStorage.setItem("locanda_last_hash", _hashAtual);
-    localStorage.setItem("locanda_last_ts", _agora.toString());
-
-    // Valida multipagamento
     if (pag === "Multipagamento") {
       const partes = _coletarMultiPagamento();
       if (partes.length < 2)
-        return alert(
+        return _mostrarErroPedido(
+          "Multipagamento",
           "Adicione pelo menos 2 formas de pagamento para o multipagamento.",
         );
       const somaPartes = partes.reduce((s, p) => s + p.valor, 0);
@@ -3717,7 +3807,8 @@ async function enviarZap() {
             : Math.max(0, freteCalculado)
           : 0);
       if (Math.abs(somaPartes - totalCheck) > 1) {
-        return alert(
+        return _mostrarErroPedido(
+          "Multipagamento",
           `A soma dos pagamentos (Gs ${somaPartes.toLocaleString("es-PY")}) não confere com o total do pedido (Gs ${totalCheck.toLocaleString("es-PY")}). Ajuste os valores.`,
         );
       }
@@ -3728,19 +3819,20 @@ async function enviarZap() {
       !localCliente &&
       !document.getElementById("check-sem-gps")?.checked
     ) {
-      alert(
-        "Por favor, calcule o frete ou marque a opção de enviar localização pelo WhatsApp",
+      return _mostrarErroPedido(
+        "Localização",
+        "Por favor, calcule o frete ou marque a opção de enviar localização pelo WhatsApp.",
       );
-      return;
     }
 
     if (modoEntrega === "delivery" && freteCalculado === null) {
-      alert(
+      return _mostrarErroPedido(
+        "Fora da área",
         "Sua localização está fora da área de entrega da loja. Não é possível finalizar o pedido.",
       );
-      return;
     }
 
+    // ═══ 2. MONTAGEM DOS DADOS ═══
     const usouPlanoB = document.getElementById("check-sem-gps")?.checked;
     const ref = document.getElementById("cli-ref").value || "";
     const telSanitizado = tel.replace(/[^\d]/g, "");
@@ -3762,25 +3854,139 @@ async function enviarZap() {
     const totalGeral =
       totalItens - desconto + (modoEntrega === "delivery" ? freteAplicado : 0);
 
-    // ─────────────────────────────────────────────────────────────────
-    //  INSERE VIA EDGE FUNCTION (validação server-side autoritativa)
-    //  Fallback: se a função não estiver deployada (404), faz INSERT
-    //  direto para não quebrar a operação em produção.
-    // ─────────────────────────────────────────────────────────────────
+    const _hashAtual = carrinho
+      .map((i) => i.nome + i.qtd)
+      .sort()
+      .join("|");
+
+    // Mensagem do WhatsApp (função para poder usar também como plano B)
+    const montarMsg = (idDisplay) => {
+      const _nomeLojaMsg = (NOME_RESTAURANTE_APP || "").trim() || "LOJA";
+      let msg = `🛒 PEDIDO #${idDisplay} - ${_nomeLojaMsg.toUpperCase()}\n`;
+      msg += `--------------------------\n`;
+      msg += `👤 Cliente: ${nome}\n`;
+      msg += `📱 Tel: ${telCompleto}\n`;
+      msg += `🛵 Tipo: ${modoEntrega === "delivery" ? "DELIVERY" : modoEntrega === "local" ? "COMER NO LOCAL 🍽️" : "RETIRADA"}\n`;
+
+      if (modoEntrega === "delivery") {
+        if (localCliente) {
+          msg += `📍 Maps: https://maps.google.com/?q=${localCliente.lat},${localCliente.lng}\n`;
+        } else if (usouPlanoB) {
+          msg += `📍 *Localização:* Enviarei aqui no WhatsApp 📎\n`;
+        }
+
+        if (freteACombinarLocal) {
+          msg += `🛵 *Delivery:* 🤝 A COMBINAR (motoboy + cliente combinam)\n`;
+        } else if (freteSemGPS) {
+          msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")} (taxa padrão)\n`;
+        } else if (freteAplicado === 0) {
+          msg += `🛵 *Delivery:* Grátis\n`;
+        } else {
+          msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
+        }
+        msg += `🏠 Ref: ${ref}\n`;
+      }
+
+      msg += `--------------------------\n`;
+      carrinho.forEach((item) => {
+        msg += `${item.qtd}x ${item.nome}`;
+        if (item.variacao) msg += ` — ${item.variacao}`;
+        if (item.preparo) msg += ` [${item.preparo}]`;
+        msg += `\n`;
+        if (item.montagem && item.montagem.length > 0)
+          msg += `   + ${item.montagem.join(", ")}\n`;
+        if (item.obs) msg += `   Obs: ${item.obs}\n`;
+      });
+
+      msg += `--------------------------\n`;
+      msg += `Subtotal: Gs ${totalItens.toLocaleString("es-PY")}\n`;
+
+      if (desconto > 0) {
+        msg += `Desconto (${cupomAplicado.codigo}): -Gs ${desconto.toLocaleString("es-PY")}\n`;
+      }
+
+      const totalGeralFinal =
+        totalItens - desconto + (modoEntrega === "delivery" ? freteAplicado : 0);
+
+      if (modoEntrega === "delivery" && !usouPlanoB) {
+        if (freteACombinarLocal) {
+          msg += `Delivery: 🤝 A COMBINAR\n`;
+          msg += `TOTAL (sem frete): Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
+        } else {
+          msg += `Delivery: Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
+          msg += `TOTAL: Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
+        }
+      } else {
+        msg += `TOTAL: Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
+      }
+      msg += `--------------------------\n`;
+
+      if (pag === "Efetivo") {
+        const trocoVal = document.getElementById("troco-valor").value;
+        msg += `💰 Pagamento: Efetivo (Troco p/: ${trocoVal})\n`;
+      } else if (pag === "Multipagamento") {
+        const partes = _coletarMultiPagamento();
+        msg += `💰 Pagamento dividido (${partes.length} formas):\n`;
+        partes.forEach((p, i) => {
+          msg += `   ${i + 1}. ${p.metodo}: Gs ${p.valor.toLocaleString("es-PY")}`;
+          if (p.troco)
+            msg += ` (Troco p/ Gs ${parseFloat(p.troco).toLocaleString("es-PY")})`;
+          msg += "\n";
+        });
+      } else {
+        msg += `💰 Pagamento: ${pag}\n`;
+      }
+
+      if (pag === "Pix" || pag === "Transferencia") {
+        if (pag === "Pix") {
+          const totalBrl =
+            COTACAO_REAL > 0
+              ? (totalGeralFinal / COTACAO_REAL).toFixed(2)
+              : "---";
+          msg += `\n💠 Chave Pix: ${CHAVE_PIX}\n`;
+          msg += `💰 Valor em Reais: R$ ${totalBrl}\n`;
+        }
+        if (pag === "Transferencia") msg += `\n📎 Alias: ${ALIAS_PY}\n`;
+        msg += `\n⚠️ *Envie o comprovante após o pagamento!*\n`;
+      }
+
+      if (pag === "Multipagamento") {
+        const partes = _coletarMultiPagamento();
+        partes.forEach((p, idx) => {
+          if (p.metodo === "Pix") {
+            const valBrl =
+              COTACAO_REAL > 0 ? (p.valor / COTACAO_REAL).toFixed(2) : "---";
+            msg += `\n💠 Pix (forma ${idx + 1}): Chave ${CHAVE_PIX} — R$ ${valBrl}\n`;
+          }
+          if (p.metodo === "Transferencia") {
+            msg += `\n📎 Alias (forma ${idx + 1}): ${ALIAS_PY}\n`;
+          }
+        });
+        const temDigital = partes.some(
+          (p) => p.metodo === "Pix" || p.metodo === "Transferencia",
+        );
+        if (temDigital)
+          msg += `\n⚠️ *Envie o(s) comprovante(s) após o pagamento!*\n`;
+      }
+
+      if (document.getElementById("check-factura").checked) {
+        msg += `\n📄 RUC: ${document.getElementById("cli-ruc").value}\nRazão: ${document.getElementById("cli-zao").value}\n`;
+      }
+      return msg;
+    };
+
+    // ═══ 3. GRAVAÇÃO NO BANCO ═══
     let pedidoDbId = null;
     let numeroPedido = null;
     let _dupResposta = false;
 
     if (typeof supa !== "undefined") {
-      // Chave de idempotência com bucket de 2 MINUTOS.
-      // - Retries dentro da janela → mesma chave → servidor deduplica
-      // - Compras futuras legítimas → novo bucket → nova chave → UNIQUE ok
-      const _pdvTimeBucket = Math.floor(Date.now() / 120000);
-      const _iKey = btoa(
-        encodeURIComponent(
-          _hashAtual + "|" + telCompleto + "|" + _pdvTimeBucket,
-        ),
-      ).slice(0, 64);
+      // Chave de idempotência ESTÁVEL por tentativa de checkout:
+      // mesma tentativa + mesmo carrinho = mesma chave (retry seguro, sem duplicar).
+      // Só é renovada após sucesso. Não há mais trava no localStorage.
+      if (!window._checkoutKey) window._checkoutKey = _uuidSimples();
+      const _iKey =
+        window._checkoutKey + "_" + _hashCurto(_hashAtual + "|" + telCompleto);
 
       const pedidoDb = {
         status: "pendente",
@@ -3827,14 +4033,14 @@ async function enviarZap() {
               razao: document.getElementById("cli-zao").value,
             }
           : null,
-        // ⚡ NOVO (push): inclui a subscription da Push API no payload.
-        // Se o usuário não ativou notificações, o valor é null e o
-        // cliente simplesmente não receberá push deste pedido.
         push_subscription: _pushSubscriptionCache || null,
       };
 
-      // 1ª tentativa: Edge Function autoritativa
       let _fnOk = false;
+      let _rejeitado = null; // recusa de regra de negócio (4xx) da Edge Function
+      let _ultimoErro = "";
+
+      // 3a. Edge Function autoritativa
       try {
         const { data: _fnRes, error: _fnErr } = await supa.functions.invoke(
           "validar-pedido",
@@ -3842,7 +4048,6 @@ async function enviarZap() {
         );
 
         if (_fnErr) {
-          // Extrai mensagem do corpo (o invoke retorna FunctionsHttpError em non-2xx)
           let _msg = "Erro ao processar pedido";
           try {
             const _ctx = _fnErr.context;
@@ -3856,26 +4061,22 @@ async function enviarZap() {
             if (_fnErr.message) _msg = _fnErr.message;
           }
 
-          // 404 = Edge Function não deployada → fallback para INSERT direto
-          const _is404 =
-            _fnErr.context?.status === 404 ||
-            /not found/i.test(_fnErr.message || "");
-          if (_is404) {
-            console.warn(
-              "[enviarZap] validar-pedido não deployada — usando INSERT direto",
-            );
+          const _st = _fnErr.context?.status;
+          _ultimoErro = `fn ${_st || "rede"}: ${_msg}`;
+          // 4xx (exceto 404/408/429) = a função RECUSOU o pedido de propósito
+          if (_st >= 400 && _st < 500 && _st !== 404 && _st !== 408 && _st !== 429) {
+            _rejeitado = _msg;
           } else {
-            alert("❌ " + _msg);
-            return;
+            // 404 / 5xx / rede / timeout → cai no INSERT direto (não perde pedido)
+            console.warn("[enviarZap] Edge Function indisponível:", _ultimoErro);
           }
         } else if (_fnRes?.error) {
-          alert("❌ " + _fnRes.error);
-          return;
+          _rejeitado = _fnRes.error;
+          _ultimoErro = "fn recusou: " + _fnRes.error;
         } else if (_fnRes?.id) {
           pedidoDbId = _fnRes.id;
           numeroPedido = _fnRes.id;
           _dupResposta = _fnRes.duplicate === true;
-          // Atualiza frete com o valor autoritativo do servidor
           if (_fnRes.frete_cobrado_cliente != null)
             freteAplicado = _fnRes.frete_cobrado_cliente;
           if (_fnRes.frete_a_combinar != null)
@@ -3883,13 +4084,18 @@ async function enviarZap() {
           _fnOk = true;
         }
       } catch (_e) {
-        console.warn(
-          "[enviarZap] Falha ao invocar Edge Function, usando INSERT direto:",
-          _e.message,
-        );
+        _ultimoErro = "fn exceção: " + (_e.message || _e);
+        console.warn("[enviarZap] Falha ao invocar Edge Function:", _e.message);
       }
 
-      // Fallback: INSERT direto quando a Edge Function não respondeu
+      if (_rejeitado) {
+        _logFalhaPedido(pedidoDb, "REJEITADO: " + _ultimoErro);
+        return _mostrarErroPedido("Não foi possível enviar o pedido", _rejeitado, {
+          retry: () => enviarZap(),
+        });
+      }
+
+      // 3b. Fallback: INSERT direto
       if (!_fnOk) {
         const { data: pedidoSalvo, error } = await supa
           .from("pedidos")
@@ -3898,169 +4104,64 @@ async function enviarZap() {
           .single();
 
         if (error) {
-          if (
-            error.code === "23505" ||
-            /duplicate key/i.test(error.message || "")
-          ) {
-            alert(
-              "⚠️ Este pedido já foi registrado. Verifique o histórico de pedidos.",
+          if (error.code === "23505" || /duplicate key/i.test(error.message || "")) {
+            // Mesma chave = este mesmo pedido já foi gravado. Tenta achar o número.
+            try {
+              const { data: ex } = await supa
+                .from("pedidos")
+                .select("id")
+                .eq("idempotency_key", _iKey)
+                .maybeSingle();
+              if (ex?.id) {
+                pedidoDbId = ex.id;
+                numeroPedido = ex.id;
+              }
+            } catch (_) {}
+            _dupResposta = true; // pedido existe → segue para confirmação
+          } else {
+            console.error("Erro ao salvar pedido:", error);
+            _logFalhaPedido(pedidoDb, `insert: ${error.code || ""} ${error.message || ""} | ${_ultimoErro}`);
+            // PLANO B: nunca perder o pedido — oferece enviar direto pelo WhatsApp
+            return _mostrarErroPedido(
+              "Não conseguimos registrar no sistema",
+              "Tente novamente ou envie seu pedido diretamente pelo WhatsApp da loja.",
+              { retry: () => enviarZap(), msgZap: montarMsg("TEMP") },
             );
-            return;
           }
-          console.error("Erro ao salvar pedido:", error);
-          alert("⚠️ Erro ao salvar pedido no sistema. Tente novamente.");
-          return;
-        }
-
-        if (pedidoSalvo) {
+        } else if (pedidoSalvo) {
           pedidoDbId = pedidoSalvo.id;
           numeroPedido = pedidoSalvo.id;
         }
       }
 
-      // Incrementa contador de usos do cupom (só se pedido realmente criado)
+      // Pedido gravado → próxima compra terá nova chave
+      window._checkoutKey = null;
+
+      // Cupom (só se o pedido foi realmente criado agora)
       if (!_dupResposta && cupomAplicado?.id && pedidoDbId) {
-        const novosUsos = (cupomAplicado.usos_realizados || 0) + 1;
-        await supa
-          .from("cupons")
-          .update({ usos_realizados: novosUsos })
-          .eq("id", cupomAplicado.id);
+        try {
+          const novosUsos = (cupomAplicado.usos_realizados || 0) + 1;
+          await supa
+            .from("cupons")
+            .update({ usos_realizados: novosUsos })
+            .eq("id", cupomAplicado.id);
+        } catch (_) {}
       }
 
-      // Se foi duplicado, avisa o cliente e mostra o tracking
+      // Pedido já registrado anteriormente: confirma + tracking (sem duplicar)
       if (_dupResposta) {
-        alert(
-          `✅ Seu pedido já havia sido registrado (#${numeroPedido}). Redirecionando para o acompanhamento.`,
-        );
-        carrinho = [];
-        cupomAplicado = null;
-        updateUI();
-        fecharCheckout();
-        mostrarCardTracking(numeroPedido);
+        _mostrarConfirmacaoPedido(numeroPedido, montarMsg(numeroPedido || "TEMP"));
+        _finalizarPedidoLocal();
+        if (numeroPedido) mostrarCardTracking(numeroPedido);
         return;
       }
     }
 
-    // Salva localmente para "Repetir Pedido"
+    // ═══ 4. PÓS-GRAVAÇÃO ═══
     localStorage.setItem("locanda_last", JSON.stringify(carrinho));
     localStorage.setItem("locanda_user", JSON.stringify({ nome, tel }));
 
-    // 2. Usa o número real do pedido na mensagem
-    const idDisplay = numeroPedido || "TEMP";
-
-    // 3. Monta Mensagem WhatsApp
-    const _nomeLojaMsg = (NOME_RESTAURANTE_APP || "").trim() || "LOJA";
-    let msg = `🛒 PEDIDO #${idDisplay} - ${_nomeLojaMsg.toUpperCase()}\n`;
-    msg += `--------------------------\n`;
-    msg += `👤 Cliente: ${nome}\n`;
-    msg += `📱 Tel: ${telCompleto}\n`;
-    msg += `🛵 Tipo: ${modoEntrega === "delivery" ? "DELIVERY" : modoEntrega === "local" ? "COMER NO LOCAL 🍽️" : "RETIRADA"}\n`;
-
-    if (modoEntrega === "delivery") {
-      if (localCliente) {
-        msg += `📍 Maps: https://maps.google.com/?q=${localCliente.lat},${localCliente.lng}\n`;
-      } else if (usouPlanoB) {
-        msg += `📍 *Localização:* Enviarei aqui no WhatsApp 📎\n`;
-      }
-
-      if (freteACombinarLocal) {
-        msg += `🛵 *Delivery:* 🤝 A COMBINAR (motoboy + cliente combinam)\n`;
-      } else if (freteSemGPS) {
-        msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")} (taxa padrão)\n`;
-      } else if (freteAplicado === 0) {
-        msg += `🛵 *Delivery:* Grátis\n`;
-      } else {
-        msg += `🛵 *Delivery:* Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
-      }
-      msg += `🏠 Ref: ${ref}\n`;
-    }
-
-    msg += `--------------------------\n`;
-    carrinho.forEach((item) => {
-      msg += `${item.qtd}x ${item.nome}`;
-      if (item.variacao) msg += ` — ${item.variacao}`;
-      if (item.preparo) msg += ` [${item.preparo}]`;
-      msg += `\n`;
-      if (item.montagem && item.montagem.length > 0)
-        msg += `   + ${item.montagem.join(", ")}\n`;
-      if (item.obs) msg += `   Obs: ${item.obs}\n`;
-    });
-
-    msg += `--------------------------\n`;
-    msg += `Subtotal: Gs ${totalItens.toLocaleString("es-PY")}\n`;
-
-    if (desconto > 0) {
-      msg += `Desconto (${cupomAplicado.codigo}): -Gs ${desconto.toLocaleString("es-PY")}\n`;
-    }
-
-    // Recalcula totalGeral com os valores autoritativos do servidor
-    const totalGeralFinal =
-      totalItens - desconto + (modoEntrega === "delivery" ? freteAplicado : 0);
-
-    if (modoEntrega === "delivery" && !usouPlanoB) {
-      if (freteACombinarLocal) {
-        msg += `Delivery: 🤝 A COMBINAR\n`;
-        msg += `TOTAL (sem frete): Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
-      } else {
-        msg += `Delivery: Gs ${freteAplicado.toLocaleString("es-PY")}\n`;
-        msg += `TOTAL: Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
-      }
-    } else {
-      msg += `TOTAL: Gs ${totalGeralFinal.toLocaleString("es-PY")}\n`;
-    }
-    msg += `--------------------------\n`;
-
-    // Pagamento e Troco
-    if (pag === "Efetivo") {
-      const trocoVal = document.getElementById("troco-valor").value;
-      msg += `💰 Pagamento: Efetivo (Troco p/: ${trocoVal})\n`;
-    } else if (pag === "Multipagamento") {
-      const partes = _coletarMultiPagamento();
-      msg += `💰 Pagamento dividido (${partes.length} formas):\n`;
-      partes.forEach((p, i) => {
-        msg += `   ${i + 1}. ${p.metodo}: Gs ${p.valor.toLocaleString("es-PY")}`;
-        if (p.troco)
-          msg += ` (Troco p/ Gs ${parseFloat(p.troco).toLocaleString("es-PY")})`;
-        msg += "\n";
-      });
-    } else {
-      msg += `💰 Pagamento: ${pag}\n`;
-    }
-
-    // Avisos de Pix/Alias
-    if (pag === "Pix" || pag === "Transferencia") {
-      if (pag === "Pix") {
-        const totalBrl =
-          COTACAO_REAL > 0 ? (totalGeralFinal / COTACAO_REAL).toFixed(2) : "---";
-        msg += `\n💠 Chave Pix: ${CHAVE_PIX}\n`;
-        msg += `💰 Valor em Reais: R$ ${totalBrl}\n`;
-      }
-      if (pag === "Transferencia") msg += `\n📎 Alias: ${ALIAS_PY}\n`;
-      msg += `\n⚠️ *Envie o comprovante após o pagamento!*\n`;
-    }
-
-    if (pag === "Multipagamento") {
-      const partes = _coletarMultiPagamento();
-      partes.forEach((p, idx) => {
-        if (p.metodo === "Pix") {
-          const valBrl =
-            COTACAO_REAL > 0 ? (p.valor / COTACAO_REAL).toFixed(2) : "---";
-          msg += `\n💠 Pix (forma ${idx + 1}): Chave ${CHAVE_PIX} — R$ ${valBrl}\n`;
-        }
-        if (p.metodo === "Transferencia") {
-          msg += `\n📎 Alias (forma ${idx + 1}): ${ALIAS_PY}\n`;
-        }
-      });
-      const temDigital = partes.some(
-        (p) => p.metodo === "Pix" || p.metodo === "Transferencia",
-      );
-      if (temDigital)
-        msg += `\n⚠️ *Envie o(s) comprovante(s) após o pagamento!*\n`;
-    }
-
-    if (document.getElementById("check-factura").checked) {
-      msg += `\n📄 RUC: ${document.getElementById("cli-ruc").value}\nRazão: ${document.getElementById("cli-zao").value}\n`;
-    }
+    const msg = montarMsg(numeroPedido || "TEMP");
 
     const _precisaZap = (() => {
       if (pag === "Pix" || pag === "Transferencia") return true;
@@ -4074,26 +4175,22 @@ async function enviarZap() {
     })();
 
     if (_precisaZap) {
+      // Pix/Transferência: modal obrigatório (comprovante)
       await _mostrarModalEnvio(msg, numeroPedido);
     } else {
-      _mostrarConfirmacaoPedido(numeroPedido);
-      carrinho = [];
-      cupomAplicado = null;
-      MODO_AGENDAMENTO = false;
-      DATA_AGENDAMENTO = null;
-      const indicadorAg = document.getElementById("indicador-agendamento");
-      if (indicadorAg) indicadorAg.remove();
-      try {
-        localStorage.removeItem("locanda_carrinho_backup");
-        localStorage.removeItem("locanda_carrinho_backup_time");
-      } catch (e) {}
-      updateUI();
-      fecharCheckout();
+      // Demais pagamentos: confirmação COM botão de WhatsApp
+      _mostrarConfirmacaoPedido(numeroPedido, msg);
+      _finalizarPedidoLocal();
       if (numeroPedido) mostrarCardTracking(numeroPedido);
     }
   } catch (err) {
     console.error("[enviarZap] Erro:", err);
-    alert("Ocorreu um erro ao processar o pedido. Tente novamente.");
+    _logFalhaPedido(null, "exceção: " + (err && err.message ? err.message : err));
+    _mostrarErroPedido(
+      "Ocorreu um erro ao processar o pedido",
+      "Seus itens continuam no carrinho. Tente novamente.",
+      { retry: () => enviarZap() },
+    );
   } finally {
     clearTimeout(_timerLiberar);
     _liberarBotao();
@@ -4184,8 +4281,8 @@ function _abrirZapEFechar(msg, numeroPedido, modal, resolve) {
   resolve();
 }
 
-// Confirmação simples (sem WhatsApp) para pagamentos em dinheiro/cartão/QR
-function _mostrarConfirmacaoPedido(numeroPedido) {
+// Confirmação para dinheiro/cartão/QR — agora com botão de WhatsApp
+function _mostrarConfirmacaoPedido(numeroPedido, msgZap) {
   const _old = document.getElementById("modal-confirmacao-pedido");
   if (_old) _old.remove();
 
@@ -4197,14 +4294,27 @@ function _mostrarConfirmacaoPedido(numeroPedido) {
     "display:flex;align-items:center;justify-content:center",
     "padding:20px;box-sizing:border-box",
   ].join(";");
+
+  const zapHref = msgZap
+    ? `https://wa.me/${FONE_LOJA}?text=${encodeURIComponent(msgZap)}`
+    : "";
+
   modal.innerHTML = `
     <div style="background:white;border-radius:20px;padding:30px 24px;max-width:380px;width:100%;text-align:center;box-shadow:0 20px 60px rgba(0,0,0,0.4)">
       <div style="font-size:3.5rem;margin-bottom:10px">✅</div>
       <h3 style="margin:0 0 8px;font-size:1.2rem;color:#1a1a2e">Pedido confirmado!</h3>
-      <p style="margin:0 0 6px;font-size:1rem;color:#27ae60;font-weight:700">Pedido #${numeroPedido || ""}</p>
-      <p style="margin:0 0 20px;font-size:0.93rem;color:#555;line-height:1.55">
+      <p style="margin:0 0 6px;font-size:1rem;color:#27ae60;font-weight:700">${numeroPedido ? "Pedido #" + numeroPedido : ""}</p>
+      <p style="margin:0 0 18px;font-size:0.93rem;color:#555;line-height:1.55">
         Seu pedido foi registrado com sucesso. Acompanhe o status abaixo.
       </p>
+      ${
+        zapHref
+          ? `<a href="${zapHref}" target="_blank" rel="noopener"
+        style="display:flex;align-items:center;justify-content:center;gap:8px;width:100%;padding:16px;background:#25D366;color:white;border-radius:14px;font-size:1rem;font-weight:800;text-decoration:none;box-sizing:border-box;margin-bottom:10px;">
+        <i class="fab fa-whatsapp" style="font-size:1.2rem;"></i> Enviar pedido no WhatsApp
+      </a>`
+          : ""
+      }
       <button onclick="document.getElementById('modal-confirmacao-pedido').remove()"
         style="width:100%;padding:16px;background:var(--primary);color:white;border:none;border-radius:14px;font-size:1rem;font-weight:700;cursor:pointer;">
         OK, acompanhar pedido
@@ -5298,9 +5408,17 @@ function _pushSuportado() {
  * Retorna "" se não configurada.
  */
 async function _pushCarregarVapidKey() {
-  // Chave pública configurada diretamente aqui (seguro, pois é uma chave pública).
-  // Substitua pelo valor que você gerou no terminal.
-  return "BK1XvptGwmUZa8bH_fxBxzhYJCD82H2UHk0vGBa6pAlIcfvmGg55iMU44BCimON33mra_SxsQBVLrEi1oO2u-Iw";
+  if (_vapidKeyCache !== null) return _vapidKeyCache;
+  try {
+    const { data } = await supa
+      .from("configuracoes")
+      .select("vapid_public_key")
+      .maybeSingle();
+    _vapidKeyCache = (data?.vapid_public_key || "").trim();
+  } catch (_) {
+    _vapidKeyCache = "";
+  }
+  return _vapidKeyCache;
 }
 
 /**
